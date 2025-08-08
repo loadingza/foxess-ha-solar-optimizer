@@ -10,4 +10,4 @@ Automation pack for FoxESS + Home Assistant that:
 > `octopus_energy_electricity_<MPAN>_<METER>_*`.  
 > Replace with your own IDs from Developer Tools → States.
 
-## Repo layout
+
