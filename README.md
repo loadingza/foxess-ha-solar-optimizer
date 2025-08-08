@@ -10,4 +10,26 @@ Automation pack for FoxESS + Home Assistant that:
 > `octopus_energy_electricity_<MPAN>_<METER>_*`.  
 > Replace with your own IDs from Developer Tools → States.
 
+## Repo layout
+home-assistant/
+automations.yaml
+configuration.snippet.yaml
+scripts.yaml
+lovelace.dashboard.yaml
 
+## Install (HA)
+1. Append `home-assistant/configuration.snippet.yaml` into your `configuration.yaml` (merge sections).
+2. Replace/merge `automations.yaml` and `scripts.yaml`.
+3. Create a dashboard from `lovelace.dashboard.yaml`.
+4. Replace all `octopus_energy_electricity_<MPAN>_<METER>_*` with your real entities.  
+5. Restart Home Assistant.
+
+## Requirements
+- Home Assistant 2024+
+- HACS `foxess_modbus` (RS485 writes enabled)
+- Octopus Energy integration (off-peak binary & import cost)
+- `binary_sensor.my_tesla_charging` (or your equivalent)
+
+## Notes
+- Power setpoints use **kW**.
+- YTD gain uses a yearly `utility_meter`.
