@@ -32,7 +32,7 @@ lovelace.dashboard.yaml
 - HACS `foxess_modbus` (RS485 writes enabled)
 - Octopus Energy integration (off-peak binary & import cost)
 - Tesla integration (`binary_sensor.my_tesla_charging`) (or your equivalent)
-## Hardware (based on my purchases - affiliated too)
+## Hardware - based on my purchases (affiliated)
 - Waveshare RS485 Modbus - https://amzn.to/4ftQm3T
 - Home assistant green - https://amzn.to/3JoUd6l
 - Decco WiFi Mesh - https://amzn.to/4lq4YCV
