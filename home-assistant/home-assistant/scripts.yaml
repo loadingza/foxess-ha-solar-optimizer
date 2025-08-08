@@ -1,0 +1,33 @@
+# Reusable script to set the inverter to a safe, idle "Feed-in First" state.
+set_feed_in_first_mode:
+  alias: "System: Set Feed-in First Mode"
+  mode: single
+  sequence:
+    - service: number.set_value
+      target:
+        entity_id:
+          - number.force_charge_power
+          - number.force_discharge_power
+      data:
+        value: 0
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Feed-in First'
+
+# Optional reusable script for EV assist (single-call helper).
+set_battery_assist_charge:
+  alias: "System: Set Battery Assist Charge for EV"
+  mode: single
+  sequence:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 2.5   # kW
