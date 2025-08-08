@@ -1,0 +1,278 @@
+---
+
+# 5) `home-assistant/configuration.snippet.yaml` (copy-paste)
+
+> Append/merge this into your `configuration.yaml`. It includes helpers, template sensors (including `*_kw` converters), statistics, and utility meters.  
+> **Placeholders kept** for Octopus entities.
+
+```yaml
+# -- HELPERS & GLOBAL CONTROLS --
+input_boolean:
+  fox_remote_control_enabled:
+    name: "Fox ESS Remote Control Enabled"
+    initial: true
+
+input_number:
+  battery_discharge_soc_target:
+    name: Battery Discharge SoC Target
+    min: 10
+    max: 50
+    step: 1
+    unit_of_measurement: "%"
+    initial: 20
+  battery_hard_soc_floor:
+    name: Battery Hard SoC Floor
+    min: 5
+    max: 20
+    step: 1
+    unit_of_measurement: "%"
+    initial: 10
+  initial_solar_investment:
+    name: "Initial Solar Investment"
+    min: 0
+    max: 50000
+    step: 100
+    unit_of_measurement: "GBP"
+    initial: 12800
+  target_discharge_rate_kw:
+    name: Target Discharge Rate
+    min: 0.1
+    max: 5.0
+    step: 0.1
+    unit_of_measurement: kW
+    initial: 2.5
+
+input_datetime:
+  charge_deadline:
+    name: Charge Deadline
+    has_date: false
+    has_time: true
+    initial: "05:20:00"
+
+# -- TEMPLATE SENSORS --
+template:
+  - sensor:
+      # ==== kW converters for dashboard consistency ====
+      - name: "PV Power kW"
+        unique_id: pv_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.pv_power') | float(0) / 1000) | round(3) }}"
+      - name: "Load Power kW"
+        unique_id: load_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}"
+      - name: "Battery Power kW"
+        unique_id: invbatpower_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.invbatpower') | float(0) / 1000) | round(3) }}"
+      - name: "Inverter Power kW"
+        unique_id: rpower_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.rpower') | float(0) / 1000) | round(3) }}"
+      - name: "PV1 Power kW"
+        unique_id: pv1_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.pv1_power') | float(0) / 1000) | round(3) }}"
+      - name: "PV2 Power kW"
+        unique_id: pv2_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ (states('sensor.pv2_power') | float(0) / 1000) | round(3) }}"
+      # If your grid sensor is already kW, this is a passthrough:
+      - name: "Net Grid Power kW"
+        unique_id: net_grid_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: "{{ states('sensor.net_grid_power') | float(default=states('sensor.grid_ct') | float(0)) | round(3) }}"
+
+      # ==== Planning / dynamic calculations ====
+      - name: "Planned Average Charge Rate"
+        unique_id: planned_average_charge_rate
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        icon: mdi:chart-line
+        state: >
+          {% set charge_start_time = today_at('23:30:00') %}
+          {% set deadline_str = states('input_datetime.charge_deadline') %}
+          {% set deadline = today_at(deadline_str) %}
+          {% if deadline.hour < charge_start_time.hour %}
+            {% set deadline_for_calc = deadline + timedelta(days=1) %}
+          {% else %}
+            {% set deadline_for_calc = deadline %}
+          {% endif %}
+          {% set total_hours = (deadline_for_calc - charge_start_time).total_seconds() / 3600 %}
+          {% if total_hours > 0 %}
+            {% set soc = states('sensor.battery_soc') | float(0) %}
+            {% set energy_to_full_kwh = ((100 - soc) / 100) * 18.65 %}
+            {% set avg_load_kw = states('sensor.average_overnight_load_kw') | float(0.3) %}
+            {% set energy_for_load_kwh = avg_load_kw * total_hours %}
+            {% set charge_efficiency = 0.94 %}
+            {% set total_energy_needed_kwh = energy_to_full_kwh + energy_for_load_kwh %}
+            {% set required_grid_import_kw = (total_energy_needed_kwh / charge_efficiency) / total_hours %}
+            {% set charge_power_kw = required_grid_import_kw - avg_load_kw %}
+            {{ [[charge_power_kw, 0] | max, 5.0] | min | round(2) }}
+          {% else %} 0 {% endif %}
+
+      - name: "Calculated Dynamic Discharge Start Time"
+        unique_id: calculated_dynamic_discharge_start_time
+        device_class: timestamp
+        state: >
+          {% set deadline = today_at('23:30:00') %}
+          {% set soc = states('sensor.battery_soc') | float(100) %}
+          {% set target_soc = states('input_number.battery_discharge_soc_target') | float(20) %}
+          {% set energy_to_discharge_kwh = ((soc - target_soc) / 100) * 18.65 %}
+          {% set target_export_rate_kw = states('input_number.target_discharge_rate_kw') | float(2.5) %}
+          {% set avg_load_kw = states('sensor.average_evening_load_kw') | float(0.4) %}
+          {% set total_depletion_rate_kw = target_export_rate_kw + avg_load_kw %}
+          {% if total_depletion_rate_kw > 0 %}
+            {% set hours_needed = energy_to_discharge_kwh / total_depletion_rate_kw %}
+            {% set start_time = deadline - timedelta(hours=hours_needed) %}
+            {{ start_time.isoformat() }}
+          {% else %}
+            {{ (deadline + timedelta(minutes=1)).isoformat() }}
+          {% endif %}
+
+      - name: "Required Dynamic Charge Power"
+        unique_id: required_dynamic_charge_power
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% set avg_load_kw = states('sensor.average_overnight_load_kw') | float(0.3) %}
+          {% set deadline_str = states('input_datetime.charge_deadline') %}
+          {% set deadline = today_at(deadline_str) %}
+          {% if now().hour >= 23 %}
+            {% set deadline_for_calc = deadline + timedelta(days=1) %}
+          {% else %}
+            {% set deadline_for_calc = deadline %}
+          {% endif %}
+          {% set remaining_hours = (deadline_for_calc - now()).total_seconds() / 3600 %}
+          {% if remaining_hours > 0.01 %}
+            {% set usable_capacity_kwh = 18.65 %}
+            {% set charge_efficiency = 0.94 %}
+            {% set energy_to_full_kwh = ((100 - soc) / 100) * usable_capacity_kwh %}
+            {% set energy_for_load_kwh = avg_load_kw * remaining_hours %}
+            {% set total_energy_needed = energy_to_full_kwh + energy_for_load_kwh %}
+            {% set required_grid_import_kw = (total_energy_needed / charge_efficiency) / remaining_hours %}
+            {{ [[required_grid_import_kw, 0] | max, 5.0] | min | round(2) }}
+          {% else %} 0 {% endif %}
+
+      - name: "Current Evening Load Power kW"
+        unique_id: current_evening_load_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% if now() >= today_at('19:00:00') and now() < today_at('23:30:00') %}
+            {{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}
+          {% else %}
+            {{ this.state | default(0) }}
+          {% endif %}
+        availability: "{{ states('sensor.load_power') not in ['unavailable', 'unknown'] }}"
+
+      - name: "Current Overnight Load Power kW"
+        unique_id: current_overnight_load_power_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state_class: measurement
+        state: >
+          {% set deadline = states('input_datetime.charge_deadline') %}
+          {% if now() >= today_at('23:30:00') or now() < today_at(deadline) %}
+            {{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}
+          {% else %}
+            {{ this.state | default(0) }}
+          {% endif %}
+        availability: "{{ states('sensor.load_power') not in ['unavailable', 'unknown'] }}"
+
+      - name: "Average Evening Load kW"
+        unique_id: average_evening_load_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state: "{{ (states('sensor.average_evening_load_raw') | float(0)) | round(3) }}"
+
+      - name: "Average Overnight Load kW"
+        unique_id: average_overnight_load_kw
+        unit_of_measurement: "kW"
+        device_class: power
+        state: "{{ (states('sensor.average_overnight_load_raw') | float(0)) | round(3) }}"
+
+      # ==== Money / ROI ====
+      - name: "Daily Export Revenue"
+        unique_id: daily_export_revenue
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        state: "{{ (states('sensor.feed_in_energy_today') | float(0) * 0.15) | round(2) }}"
+
+      - name: "Daily Import Cost Avoided"
+        unique_id: daily_import_cost_avoided
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        state: "{{ (states('sensor.daily_battery_discharge') | float(0) * 0.287) | round(2) }}"
+
+      - name: "Total Daily Financial Gain"
+        unique_id: total_daily_financial_gain
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        state: >
+          {{ (states('sensor.daily_import_cost_avoided') | float(0)
+            + states('sensor.daily_export_revenue') | float(0)) | round(2)}}
+
+      - name: "Daily Net Profit"
+        unique_id: daily_net_profit
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        state: >
+          {{ (states('sensor.daily_export_revenue') | float(0)
+            - states('sensor.octopus_energy_electricity_<MPAN>_<METER>_current_accumulative_cost') | float(0)) | round(2)}}
+
+      - name: "Current ROI Percentage"
+        unique_id: current_roi_percentage
+        unit_of_measurement: "%"
+        state: >
+          {% set total_gain = states('sensor.total_financial_gain_ytd') | float(0) %}
+          {% set investment = states('input_number.initial_solar_investment') | float(0) %}
+          {% if investment > 0 %} {{ (total_gain / investment * 100) | round(2) }} {% else %} 0 {% endif %}
+
+sensor:
+  - platform: statistics
+    name: "Average Evening Load Raw"
+    unique_id: average_evening_load_raw
+    entity_id: sensor.current_evening_load_power_kw
+    state_characteristic: mean
+    max_age:
+      days: 7
+  - platform: statistics
+    name: "Average Overnight Load Raw"
+    unique_id: average_overnight_load_raw
+    entity_id: sensor.current_overnight_load_power_kw
+    state_characteristic: mean
+    max_age:
+      days: 7
+
+utility_meter:
+  daily_battery_charge:
+    source: sensor.battery_charge_today
+    name: Daily Battery Charge
+    cycle: daily
+  daily_battery_discharge:
+    source: sensor.battery_discharge_today
+    name: Daily Battery Discharge
+    cycle: daily
+  total_financial_gain_ytd:
+    source: sensor.total_daily_financial_gain
+    name: "Total Financial Gain YTD"
+    cycle: yearly
