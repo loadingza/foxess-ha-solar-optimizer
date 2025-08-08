@@ -1,0 +1,270 @@
+# ==============================================================================
+# === SYSTEM STATE & MODE CONTROL ==============================================
+# ==============================================================================
+- id: solar_set_daytime_feed_in_mode
+  alias: System - Set Daytime Feed-in First Mode
+  mode: single
+  trigger:
+    - platform: time
+      at: '05:30:05'
+    - platform: homeassistant
+      event: start
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: time
+      after: '05:30:00'
+  action:
+    - service: script.turn_on
+      target:
+        entity_id: script.set_feed_in_first_mode
+
+# ==============================================================================
+# === PEAK TIME DISCHARGE LOGIC (EVENING) ======================================
+# ==============================================================================
+- id: battery_execute_dynamic_evening_discharge
+  alias: Battery - Execute Dynamic Evening Discharge
+  mode: single
+  trigger:
+    - platform: time_pattern
+      seconds: "/3"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: template
+      value_template: "{{ now() >= states('sensor.calculated_dynamic_discharge_start_time') | as_datetime | as_local }}"
+    - condition: time
+      before: '23:30:00'
+    # numeric_state cannot compare to another entity: use template
+    - condition: template
+      value_template: >
+        {{ states('sensor.battery_soc') | float(0)
+           > states('input_number.battery_hard_soc_floor') | float(10) }}
+  action:
+    - choose:
+        - conditions:
+            # Compare load (kW) to target discharge (kW)
+            - condition: template
+              value_template: >
+                {{ (states('sensor.load_power') | float(0) / 1000)
+                    > (states('input_number.target_discharge_rate_kw') | float(0)) }}
+          sequence:
+            - if:
+                - condition: not
+                  conditions:
+                    - condition: state
+                      entity_id: select.work_mode
+                      state: 'Feed-in First'
+              then:
+                - service: script.turn_on
+                  target:
+                    entity_id: script.set_feed_in_first_mode
+      default:
+        - if:
+            - condition: not
+              conditions:
+                - condition: state
+                  entity_id: select.work_mode
+                  state: 'Force Discharge'
+          then:
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Force Discharge'
+        - service: number.set_value
+          target:
+            entity_id: number.force_discharge_power
+          data:
+            value: "{{ states('input_number.target_discharge_rate_kw') | float(2.5) }}"
+
+# ==============================================================================
+# === OFF-PEAK CHARGE LOGIC (NIGHT) ============================================
+# ==============================================================================
+- id: battery_execute_off_peak_grid_charge
+  alias: Battery - Execute Off-Peak Grid Charge (Starter)
+  mode: single
+  trigger:
+    # Start at beginning of off-peak
+    - platform: state
+      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
+      to: 'on'
+    # Restart-safe: wait until SoC is stable post-restart
+    - platform: state
+      entity_id: sensor.battery_soc
+      for:
+        seconds: 15
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: numeric_state
+      entity_id: sensor.battery_soc
+      below: 90
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
+      state: 'on'
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - delay: '00:00:02'
+    - service: automation.trigger
+      target:
+        entity_id: automation.battery_regulate_off_peak_charge_power
+
+- id: battery_regulate_off_peak_charge_power
+  alias: Battery - Regulate Off-Peak Charge Power
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+  condition:
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
+      state: 'on'
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Force Charge'
+    - condition: numeric_state
+      entity_id: sensor.battery_soc
+      below: 90
+  action:
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: "{{ states('sensor.required_dynamic_charge_power') | float(0) }}"
+
+- id: battery_stop_off_peak_charge
+  alias: Battery - Stop Off-Peak Charge
+  mode: single
+  trigger:
+    - platform: numeric_state
+      entity_id: sensor.battery_soc
+      above: 90
+    - platform: time
+      at: input_datetime.charge_deadline
+  condition:
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Force Charge'
+  action:
+    - service: script.turn_on
+      target:
+        entity_id: script.set_feed_in_first_mode
+    - delay: '00:00:02'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 0
+
+# ==============================================================================
+# === PEAK EV CHARGING - START BATTERY CHARGE ==================================
+# ==============================================================================
+- id: solar_peak_ev_charge_assist_start
+  alias: Solar: START Force Charge when Tesla charges during peak hours
+  description: When the Tesla starts charging between 05:30–23:30, force charge the battery at 2.5 kW from the grid.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.my_tesla_charging
+      to: 'on'
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: time
+      after: '05:30:00'
+      before: '23:30:00'
+    - condition: numeric_state
+      entity_id: sensor.battery_soc
+      below: 90
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 2.5   # kW
+
+# ==============================================================================
+# === PEAK EV CHARGING - STOP BATTERY CHARGE ===================================
+# ==============================================================================
+- id: solar_peak_ev_charge_assist_stop
+  alias: Solar: STOP Force Charge when Tesla stops or peak window ends
+  description: Reverts the inverter to Feed-in First when EV charging stops or at 23:30.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.my_tesla_charging
+      to: 'off'
+    - platform: time
+      at: '23:30:00'
+  condition:
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Force Charge'
+  action:
+    - service: script.turn_on
+      target:
+        entity_id: script.set_feed_in_first_mode
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 0
+
+# ==============================================================================
+# === SYSTEM STATE RECOVERY (SELF-HEALING) =====================================
+# ==============================================================================
+- id: battery_recover_off_peak_charge_state
+  alias: System - Recover Off-Peak Charge State
+  description: Periodically enforces Force Charge during off-peak if the battery is not full.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: and
+      conditions:
+        - condition: state
+          entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
+          state: 'on'
+        - condition: numeric_state
+          entity_id: sensor.battery_soc
+          below: 90
+        - condition: not
+          conditions:
+            - condition: state
+              entity_id: select.work_mode
+              state: 'Force Charge'
+        - condition: state
+          entity_id: input_boolean.fox_remote_control_enabled
+          state: 'on'
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Solar System State Recovery"
+        message: >
+          Inverter was in the wrong mode ({{ states('select.work_mode') }})
+          during off-peak. Setting 'Force Charge'. SoC: {{ states('sensor.battery_soc') }}%.
+        notification_id: "solar_state_recovery"
+    - repeat:
+        count: 3
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: select.work_mode
+            data:
+              option: 'Force Charge'
+          - delay: "00:00:15"
