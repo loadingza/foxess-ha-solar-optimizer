@@ -1,0 +1,10 @@
+# Home Assistant internals
+.storage/
+home-assistant_v2.db*
+deps/
+secrets.yaml
+.secrets.yaml
+
+# OS cruft
+.DS_Store
+Thumbs.db
