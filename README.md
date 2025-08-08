@@ -1,5 +1,7 @@
 # FoxESS + Home Assistant Solar Optimizer
 
+👉 **Setup Guide:** see [`docs/setup.md`](docs/setup.md)
+
 Automation pack for FoxESS + Home Assistant that:
 - Calculates a **dynamic evening discharge start** to hit a target SoC floor by 23:30.
 - Charges **off-peak** to ~90% by a set **deadline** with adaptive charge power.
