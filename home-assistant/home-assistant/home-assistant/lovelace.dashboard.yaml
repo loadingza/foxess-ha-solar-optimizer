@@ -1,0 +1,249 @@
+title: Solar and Battery Optimisation
+views:
+  - title: ☀️ Solar & Battery Overview
+    icon: mdi:solar-power-variant
+    type: sections
+    badges:
+      - type: entity
+        entity: select.work_mode
+        name: Work Mode
+      - type: entity
+        entity: binary_sensor.my_tesla_charging
+        name: Tesla Charging
+      - type: entity
+        entity: sensor.solar_energy_today
+        name: Solar Today
+      - type: entity
+        entity: weather.forecast_home
+
+    sections:
+      - type: grid
+        cards:
+          - type: vertical-stack
+            cards:
+              - type: entities
+                show_header_toggle: false
+                entities:
+                  - entity: input_number.target_discharge_rate_kw
+                    name: Target Discharge Rate (kW)
+                  - entity: input_number.battery_discharge_soc_target
+                    name: Discharge Target SoC (%)
+                  - entity: sensor.calculated_dynamic_discharge_start_time
+                    name: Calculated Start Time
+                  - type: section
+                  - entity: input_datetime.charge_deadline
+                    name: Charge By Deadline
+                  - entity: sensor.planned_average_charge_rate
+                    name: Calculated Charge Rate (kW)
+
+          - type: custom:gauge-card-pro
+            entity: sensor.bms_cell_temp_high
+            entity2: sensor.invtemp
+            needle: true
+            segments:
+              - from: 0
+                color: var(--light-green-color)
+              - from: 30
+                color: var(--light-blue-color)
+              - from: 45
+                color: var(--red-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(1) }}°C'
+              secondary: '{{ states(entity2) | float(0) | round(1) }}°C'
+            titles:
+              primary: Battery Temp
+              secondary: Inverter Temp
+            min: 0
+            max: 60
+
+          - type: custom:gauge-card-pro
+            entity: sensor.battery_soc
+            entity2: sensor.battery_soh
+            needle: true
+            segments:
+              - from: 0
+                color: var(--red-color)
+              - from: 40
+                color: var(--light-blue-color)
+              - from: 80
+                color: var(--light-green-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(0) }}%'
+              secondary: '{{ states(entity2) | float(0) | round(0) }}%'
+            titles:
+              primary: Battery SoC
+              secondary: Battery SoH
+            min: 0
+            max: 100
+
+          - type: custom:gauge-card-pro
+            entity: sensor.net_grid_power_kw
+            needle: true
+            segments:
+              - from: -15
+                color: var(--red-color)
+              - from: 0
+                color: var(--light-blue-color)
+              - from: 5
+                color: var(--light-green-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(2) }} kW'
+            titles:
+              primary: Net Grid
+            min: -15
+            max: 5
+
+          - type: custom:gauge-card-pro
+            entity: sensor.load_power_kw
+            entity2: sensor.pv_power_kw
+            needle: true
+            min: 0
+            max: 5
+            segments:
+              - from: 0
+                color: var(--light-green-color)
+              - from: 2.5
+                color: var(--light-blue-color)
+              - from: 5
+                color: var(--red-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(2) }} kW'
+              secondary: '{{ states(entity2) | float(0) | round(2) }} kW'
+            titles:
+              primary: House Load
+              secondary: PV Power
+
+          - type: custom:gauge-card-pro
+            entity: sensor.pv2_power_kw
+            entity2: sensor.pv1_power_kw
+            needle: true
+            min: 0
+            max: 3
+            segments:
+              - from: 0
+                color: var(--light-green-color)
+              - from: 1
+                color: var(--light-blue-color)
+              - from: 3
+                color: var(--red-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(2) }} kW'
+              secondary: '{{ states(entity2) | float(0) | round(2) }} kW'
+            titles:
+              primary: House Panel
+              secondary: Garage Panel
+
+          - type: custom:gauge-card-pro
+            entity: sensor.rpower_kw
+            entity2: sensor.invbatpower_kw
+            needle: true
+            min: 0
+            max: 5
+            segments:
+              - from: 0
+                color: var(--light-green-color)
+              - from: 1.5
+                color: var(--light-blue-color)
+              - from: 4
+                color: var(--red-color)
+            value_texts:
+              primary: '{{ states(entity) | float(0) | round(2) }} kW'
+              secondary: '{{ states(entity2) | float(0) | round(2) }} kW'
+            titles:
+              primary: Inverter Power
+              secondary: Battery Power
+
+          - type: custom:apexcharts-card
+            header:
+              title: Weekly Profit & Loss
+              show: true
+            graph_span: 7d
+            apex_config:
+              annotations:
+                yaxis:
+                  - y: 0
+                    borderColor: '#999'
+                    strokeDashArray: 0
+                    borderWidth: 2
+              chart:
+                stacked: false
+            series:
+              - entity: sensor.daily_export_revenue
+                name: Export Revenue
+                type: column
+                group_by:
+                  func: max
+              - entity: sensor.octopus_energy_electricity_<MPAN>_<METER>_current_accumulative_cost
+                name: Import Cost
+                type: column
+                group_by:
+                  func: max
+                transform: return x * -1;
+              - entity: sensor.daily_net_profit
+                name: Net Profit
+                type: line
+                stroke_width: 3
+                curve: smooth
+                group_by:
+                  func: last
+
+          - type: custom:apexcharts-card
+            header:
+              title: Daily Power Flow
+              show: true
+            graph_span: 1d
+            series:
+              - entity: sensor.pv_power_kw
+                name: Solar
+                type: area
+                opacity: 0.5
+                group_by: { func: avg, duration: 5min }
+              - entity: sensor.load_power_kw
+                name: House Load
+                type: line
+                stroke_width: 2
+                group_by: { func: avg, duration: 5min }
+              - entity: sensor.invbatpower_kw
+                name: Battery Flow
+                type: area
+                opacity: 0.5
+                group_by: { func: avg, duration: 5min }
+
+          - type: custom:apexcharts-card
+            header:
+              title: Battery Analysis
+              show: true
+            graph_span: 1d
+            apex_config:
+              yaxis:
+                - seriesName: SoC
+                  title: { text: SoC (%) }
+                  min: 0
+                  max: 100
+                  decimalsInFloat: 0
+                - seriesName: Power
+                  opposite: true
+                  title: { text: Power (kW) }
+                  decimalsInFloat: 0
+              annotations:
+                yaxis:
+                  - y: 0
+                    borderColor: '#999'
+                    strokeDashArray: 0
+                    borderWidth: 2
+            series:
+              - entity: sensor.battery_soc
+                name: SoC
+                yaxis_id: SoC
+                type: line
+                stroke_width: 3
+                curve: smooth
+                group_by: { func: avg, duration: 5min }
+              - entity: sensor.invbatpower_kw
+                name: Power
+                yaxis_id: Power
+                type: area
+                curve: smooth
+                stroke_width: 2
+                opacity: 0.5
+                group_by: { func: avg, duration: 5min }
