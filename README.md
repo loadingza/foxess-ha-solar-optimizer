@@ -1,4 +1,4 @@
-# FoxESS + Home Assistant Solar Optimizer
+# FoxESS + Home Assistant Solar Optimizer: Fairly new to it all (use at own risk)
 
 👉 **Setup Guide:** see [`docs/setup.md`](docs/setup.md)
 
