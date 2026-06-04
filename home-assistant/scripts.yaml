@@ -1,0 +1,66 @@
+# =============================================================================
+# SCRIPTS - REUSABLE INVERTER STATE CHANGES
+# =============================================================================
+
+# Set the inverter to Feed-in First mode (the safe default for daytime).
+# In this mode: solar → home load → grid export. Battery is NOT charged
+# from solar (which is what we want — export at 12p > charge at 5p).
+set_feed_in_first_mode:
+  alias: "System: Set Feed-in First Mode"
+  mode: single
+  sequence:
+    # Zero out both charge/discharge powers before mode change to avoid
+    # the inverter applying a stale value when it changes mode. Each
+    # `set_value` is wrapped with continue_on_error so a transient failure
+    # on one number doesn't prevent the mode change itself.
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 0
+      continue_on_error: true
+    - service: number.set_value
+      target:
+        entity_id: number.force_discharge_power
+      data:
+        value: 0
+      continue_on_error: true
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Feed-in First'
+
+# Manually trigger an off-peak top-up (handy for testing or one-off boosts)
+manual_force_charge_now:
+  alias: "System: Manual Force Charge Now"
+  mode: single
+  sequence:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: 5.0  # max inverter limit
+
+# Manually pause all battery activity (useful while doing maintenance/testing)
+pause_all_battery_activity:
+  alias: "System: Pause All Battery Activity"
+  mode: single
+  sequence:
+    - service: number.set_value
+      target:
+        entity_id:
+          - number.force_charge_power
+          - number.force_discharge_power
+      data:
+        value: 0
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Self Use'

@@ -1,252 +1,417 @@
----
+# =============================================================================
+# configuration.yaml snippet — FoxESS solar/battery optimizer
+# Helpers, template sensors (incl. *_kw converters), 14-day load
+# statistics, and battery utility meters. Merge into your configuration.yaml.
+# Octopus IDs are placeholders — replace with your own.
+# =============================================================================
 
-# 5) `home-assistant/configuration.snippet.yaml` (copy-paste)
-
-> Append/merge this into your `configuration.yaml`. It includes helpers, template sensors (including `*_kw` converters), statistics, and utility meters.  
-> **Placeholders kept** for Octopus entities.
-
-```yaml
-# -- HELPERS & GLOBAL CONTROLS --
+# =============================================================================
+# HELPERS — TUNABLE FROM THE DASHBOARD
+# =============================================================================
 input_boolean:
   fox_remote_control_enabled:
     name: "Fox ESS Remote Control Enabled"
-    initial: true
+    icon: mdi:home-battery
 
 input_number:
+  # ---------------------------------------------------------------------------
+  # BATTERY HEALTH (longevity caps — pushed to inverter BMS via automation)
+  # ---------------------------------------------------------------------------
+  battery_max_soc:
+    name: "Battery Max SoC"
+    min: 80
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-up
+    initial: 95
+
+  battery_min_soc:
+    name: "Battery Min SoC"
+    min: 5
+    max: 30
+    step: 1
+    unit_of_measurement: "%"
+    icon: mdi:battery-arrow-down
+    initial: 15
+
+  # ---------------------------------------------------------------------------
+  # DISCHARGE BEHAVIOUR
+  # ---------------------------------------------------------------------------
   battery_discharge_soc_target:
-    name: Battery Discharge SoC Target
-    min: 10
+    name: "Battery Evening Discharge Target SoC"
+    min: 15
     max: 50
     step: 1
     unit_of_measurement: "%"
+    icon: mdi:battery-clock
     initial: 20
-  battery_hard_soc_floor:
-    name: Battery Hard SoC Floor
-    min: 5
-    max: 20
-    step: 1
+
+  target_discharge_rate_kw:
+    name: "Target Discharge Rate"
+    min: 0.1
+    max: 5.0
+    step: 0.1
+    unit_of_measurement: kW
+    icon: mdi:flash
+    initial: 2.5
+
+  # ---------------------------------------------------------------------------
+  # TESLA PEAK ASSIST
+  # ---------------------------------------------------------------------------
+  tesla_peak_assist_min_soc:
+    name: "Min Battery SoC for Tesla Peak Assist"
+    min: 20
+    max: 60
+    step: 5
     unit_of_measurement: "%"
-    initial: 10
+    icon: mdi:car-battery
+    initial: 30
+
+  # ---------------------------------------------------------------------------
+  # FINANCIALS
+  # ---------------------------------------------------------------------------
   initial_solar_investment:
     name: "Initial Solar Investment"
     min: 0
     max: 50000
     step: 100
     unit_of_measurement: "GBP"
+    icon: mdi:cash
     initial: 12800
-  target_discharge_rate_kw:
-    name: Target Discharge Rate
-    min: 0.1
-    max: 5.0
-    step: 0.1
-    unit_of_measurement: kW
-    initial: 2.5
+
+  peak_import_rate_estimate:
+    name: "Peak Import Rate (for savings calc)"
+    min: 0.10
+    max: 0.50
+    step: 0.001
+    unit_of_measurement: "GBP/kWh"
+    icon: mdi:currency-gbp
+    initial: 0.287
+
+  off_peak_import_rate_estimate:
+    name: "Off-Peak Import Rate (for savings calc)"
+    min: 0.01
+    max: 0.20
+    step: 0.001
+    unit_of_measurement: "GBP/kWh"
+    icon: mdi:currency-gbp
+    initial: 0.052
 
 input_datetime:
   charge_deadline:
-    name: Charge Deadline
+    name: "Off-Peak Charge Deadline"
     has_date: false
     has_time: true
-    initial: "05:20:00"
+    initial: "05:25:00"
 
-# -- TEMPLATE SENSORS --
+# =============================================================================
+# TEMPLATE SENSORS
+# =============================================================================
 template:
-  - sensor:
-      # ==== kW converters for dashboard consistency ====
-      - name: "PV Power kW"
-        unique_id: pv_power_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.pv_power') | float(0) / 1000) | round(3) }}"
-      - name: "Load Power kW"
-        unique_id: load_power_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}"
-      - name: "Battery Power kW"
-        unique_id: invbatpower_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.invbatpower') | float(0) / 1000) | round(3) }}"
-      - name: "Inverter Power kW"
-        unique_id: rpower_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.rpower') | float(0) / 1000) | round(3) }}"
-      - name: "PV1 Power kW"
-        unique_id: pv1_power_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.pv1_power') | float(0) / 1000) | round(3) }}"
-      - name: "PV2 Power kW"
-        unique_id: pv2_power_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ (states('sensor.pv2_power') | float(0) / 1000) | round(3) }}"
-      # If your grid sensor is already kW, this is a passthrough:
-      - name: "Net Grid Power kW"
-        unique_id: net_grid_power_kw
-        unit_of_measurement: "kW"
-        device_class: power
-        state_class: measurement
-        state: "{{ states('sensor.net_grid_power') | float(default=states('sensor.grid_ct') | float(0)) | round(3) }}"
+  - binary_sensor:
+      # --------------------------------------------------------------------
+      # BATTERY CHARGE WINDOW — single source of truth for "is there an
+      # owner who should be holding the inverter in Force Charge / Back-up
+      # right now?". Used by start, stop, recover, release, and the
+      # perk-stop automations so they stay mutually consistent.
+      #
+      # True when:
+      #   * In the planned overnight window (23:30 → charge_deadline), OR
+      #   * A Tesla smart dispatch is genuinely in progress (dispatch flag
+      #     set AND car actually charging — avoids phantom dispatches).
+      # --------------------------------------------------------------------
+      - name: "Battery Charge Window Active"
+        unique_id: battery_charge_window_active
+        availability: "{{ has_value('input_datetime.charge_deadline') }}"
+        state: >-
+          {%- set deadline = states('input_datetime.charge_deadline') -%}
+          {%- set in_planned = now() >= today_at('23:30:00') or now() < today_at(deadline) -%}
+          {%- set tesla_dispatch = is_state('binary_sensor.octopus_energy_<INTELLIGENT_DEVICE>_intelligent_dispatching', 'on')
+                                   and is_state('binary_sensor.my_tesla_charging', 'on') -%}
+          {{ in_planned or tesla_dispatch }}
 
-      # ==== Planning / dynamic calculations ====
+  - sensor:
+      # -----------------------------------------------------------------------
+      # USABLE CAPACITY — derived from max/min SoC, used everywhere downstream
+      # -----------------------------------------------------------------------
+      - name: "Battery Usable Capacity"
+        unique_id: battery_usable_capacity_kwh
+        unit_of_measurement: "kWh"
+        device_class: energy
+        state_class: measurement
+        state: >-
+          {% set max_soc = states('input_number.battery_max_soc') | float(95) %}
+          {% set min_soc = states('input_number.battery_min_soc') | float(15) %}
+          {% set nominal = 20.72 %}
+          {{ (nominal * (max_soc - min_soc) / 100) | round(2) }}
+
+      # -----------------------------------------------------------------------
+      # PLANNED AVERAGE CHARGE RATE
+      # Used for displaying expected overnight charge power
+      # -----------------------------------------------------------------------
       - name: "Planned Average Charge Rate"
         unique_id: planned_average_charge_rate
         unit_of_measurement: "kW"
         device_class: power
         state_class: measurement
         icon: mdi:chart-line
-        state: >
-          {% set charge_start_time = today_at('23:30:00') %}
+        availability: >-
+          {{ has_value('sensor.battery_soc') and
+             has_value('input_number.battery_max_soc') and
+             has_value('input_datetime.charge_deadline') }}
+        state: >-
+          {# Same model as required_dynamic_charge_power_kw: only consider
+             the battery's energy needs and the off-peak window length.
+             House load is supplied by grid concurrently, irrelevant
+             to the battery charge rate. #}
+          {% set charge_start = today_at('23:30:00') %}
           {% set deadline_str = states('input_datetime.charge_deadline') %}
           {% set deadline = today_at(deadline_str) %}
-          {% if deadline.hour < charge_start_time.hour %}
-            {% set deadline_for_calc = deadline + timedelta(days=1) %}
+          {% if deadline.hour < charge_start.hour %}
+            {% set deadline_calc = deadline + timedelta(days=1) %}
           {% else %}
-            {% set deadline_for_calc = deadline %}
+            {% set deadline_calc = deadline %}
           {% endif %}
-          {% set total_hours = (deadline_for_calc - charge_start_time).total_seconds() / 3600 %}
+          {% set total_hours = (deadline_calc - charge_start).total_seconds() / 3600 %}
           {% if total_hours > 0 %}
             {% set soc = states('sensor.battery_soc') | float(0) %}
-            {% set energy_to_full_kwh = ((100 - soc) / 100) * 18.65 %}
-            {% set avg_load_kw = states('sensor.average_overnight_load_kw') | float(0.3) %}
-            {% set energy_for_load_kwh = avg_load_kw * total_hours %}
-            {% set charge_efficiency = 0.94 %}
-            {% set total_energy_needed_kwh = energy_to_full_kwh + energy_for_load_kwh %}
-            {% set required_grid_import_kw = (total_energy_needed_kwh / charge_efficiency) / total_hours %}
-            {% set charge_power_kw = required_grid_import_kw - avg_load_kw %}
-            {{ [[charge_power_kw, 0] | max, 5.0] | min | round(2) }}
-          {% else %} 0 {% endif %}
+            {% set max_soc = states('input_number.battery_max_soc') | float(95) %}
+            {% set nominal = 20.72 %}
+            {% set efficiency = 0.94 %}
+            {% set energy_to_target = ([(max_soc - soc), 0] | max / 100) * nominal %}
+            {% set charge_pwr = (energy_to_target / efficiency) / total_hours %}
+            {{ [[charge_pwr, 0] | max, 5.0] | min | round(2) }}
+          {% else %}
+            0
+          {% endif %}
 
+      # -----------------------------------------------------------------------
+      # DYNAMIC DISCHARGE START TIME — calculated to land near 23:30
+      # -----------------------------------------------------------------------
       - name: "Calculated Dynamic Discharge Start Time"
         unique_id: calculated_dynamic_discharge_start_time
         device_class: timestamp
-        state: >
+        availability: >-
+          {{ has_value('sensor.battery_soc') and
+             has_value('input_number.battery_discharge_soc_target') and
+             has_value('input_number.target_discharge_rate_kw') and
+             has_value('sensor.average_evening_load_kw') }}
+        state: >-
           {% set deadline = today_at('23:30:00') %}
           {% set soc = states('sensor.battery_soc') | float(100) %}
           {% set target_soc = states('input_number.battery_discharge_soc_target') | float(20) %}
-          {% set energy_to_discharge_kwh = ((soc - target_soc) / 100) * 18.65 %}
-          {% set target_export_rate_kw = states('input_number.target_discharge_rate_kw') | float(2.5) %}
-          {% set avg_load_kw = states('sensor.average_evening_load_kw') | float(0.4) %}
-          {% set total_depletion_rate_kw = target_export_rate_kw + avg_load_kw %}
-          {% if total_depletion_rate_kw > 0 %}
-            {% set hours_needed = energy_to_discharge_kwh / total_depletion_rate_kw %}
-            {% set start_time = deadline - timedelta(hours=hours_needed) %}
-            {{ start_time.isoformat() }}
+          {% set nominal = 20.72 %}
+          {% set energy_to_discharge = ([(soc - target_soc), 0] | max / 100) * nominal %}
+          {% set target_export = states('input_number.target_discharge_rate_kw') | float(2.5) %}
+          {% set avg_load = states('sensor.average_evening_load_kw') | float(0.4) %}
+          {% set total_rate = target_export + avg_load %}
+          {% if total_rate > 0 %}
+            {% set hours = energy_to_discharge / total_rate %}
+            {{ (deadline - timedelta(hours=hours)).isoformat() }}
           {% else %}
             {{ (deadline + timedelta(minutes=1)).isoformat() }}
           {% endif %}
 
-      - name: "Required Dynamic Charge Power"
-        unique_id: required_dynamic_charge_power
+      # -----------------------------------------------------------------------
+      # REQUIRED DYNAMIC CHARGE POWER — recalculated every minute by HA
+      # Targets max_soc instead of 100% to enforce the longevity cap
+      # -----------------------------------------------------------------------
+      # Suffixed _kw to dodge the entity-registry W-override that haunted the
+      # original `required_dynamic_charge_power` (HA was converting kW→W behind
+      # the scenes, so consumers read 2530 and the [..., 5.0]|min always
+      # picked 5 → every overnight charge pegged at 5 kW).
+      - name: "Required Dynamic Charge Power kW"
+        unique_id: required_dynamic_charge_power_kw
         unit_of_measurement: "kW"
         device_class: power
         state_class: measurement
-        state: >
+        availability: >-
+          {{ has_value('sensor.battery_soc') and
+             has_value('input_number.battery_max_soc') and
+             has_value('input_datetime.charge_deadline') }}
+        state: >-
+          {# force_charge_power controls the battery's charging rate only.
+             Grid covers house load (Volvo/Tesla/fridge/etc) separately,
+             so the calculation is purely a function of battery kWh
+             needed, charging efficiency, and remaining off-peak time. #}
           {% set soc = states('sensor.battery_soc') | float(0) %}
-          {% set avg_load_kw = states('sensor.average_overnight_load_kw') | float(0.3) %}
+          {% set max_soc = states('input_number.battery_max_soc') | float(95) %}
           {% set deadline_str = states('input_datetime.charge_deadline') %}
           {% set deadline = today_at(deadline_str) %}
-          {% if now().hour >= 23 %}
-            {% set deadline_for_calc = deadline + timedelta(days=1) %}
+          {# Pick the NEXT occurrence of the deadline rather than gating on
+             now().hour >= 23. The old guard caused negative remaining_hours
+             (and an instant 0 kW output) for any consumer reading this
+             sensor between 05:25 and 23:00 — i.e. daytime smart dispatch,
+             Greener Nights, and Free Electricity all got 0 kW. #}
+          {% if deadline <= now() %}
+            {% set deadline_calc = deadline + timedelta(days=1) %}
           {% else %}
-            {% set deadline_for_calc = deadline %}
+            {% set deadline_calc = deadline %}
           {% endif %}
-          {% set remaining_hours = (deadline_for_calc - now()).total_seconds() / 3600 %}
-          {% if remaining_hours > 0.01 %}
-            {% set usable_capacity_kwh = 18.65 %}
-            {% set charge_efficiency = 0.94 %}
-            {% set energy_to_full_kwh = ((100 - soc) / 100) * usable_capacity_kwh %}
-            {% set energy_for_load_kwh = avg_load_kw * remaining_hours %}
-            {% set total_energy_needed = energy_to_full_kwh + energy_for_load_kwh %}
-            {% set required_grid_import_kw = (total_energy_needed / charge_efficiency) / remaining_hours %}
-            {{ [[required_grid_import_kw, 0] | max, 5.0] | min | round(2) }}
-          {% else %} 0 {% endif %}
+          {% set remaining_hours = (deadline_calc - now()).total_seconds() / 3600 %}
+          {% if remaining_hours > 0.01 and soc < max_soc %}
+            {% set nominal = 20.72 %}
+            {% set efficiency = 0.94 %}
+            {% set energy_to_target = ((max_soc - soc) / 100) * nominal %}
+            {% set charge_pwr = (energy_to_target / efficiency) / remaining_hours %}
+            {{ [[charge_pwr, 0] | max, 5.0] | min | round(2) }}
+          {% else %}
+            0
+          {% endif %}
 
+      # -----------------------------------------------------------------------
+      # LOAD POWER TRACKING — sensor.load_power is in kW, no conversion needed
+      # -----------------------------------------------------------------------
+      # Outside the measurement window, return `unavailable` so the 14-day
+       # statistics sensor doesn't see repeated stale samples (was previously
+       # echoing `this.state` indefinitely, biasing the rolling average).
       - name: "Current Evening Load Power kW"
         unique_id: current_evening_load_power_kw
         unit_of_measurement: "kW"
         device_class: power
         state_class: measurement
-        state: >
-          {% if now() >= today_at('19:00:00') and now() < today_at('23:30:00') %}
-            {{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}
-          {% else %}
-            {{ this.state | default(0) }}
-          {% endif %}
-        availability: "{{ states('sensor.load_power') not in ['unavailable', 'unknown'] }}"
+        availability: >-
+          {{ has_value('sensor.load_power') and
+             today_at('19:00:00') <= now() < today_at('23:30:00') }}
+        state: "{{ states('sensor.load_power') | float(0) | round(3) }}"
 
       - name: "Current Overnight Load Power kW"
         unique_id: current_overnight_load_power_kw
         unit_of_measurement: "kW"
         device_class: power
         state_class: measurement
-        state: >
-          {% set deadline = states('input_datetime.charge_deadline') %}
-          {% if now() >= today_at('23:30:00') or now() < today_at(deadline) %}
-            {{ (states('sensor.load_power') | float(0) / 1000) | round(3) }}
-          {% else %}
-            {{ this.state | default(0) }}
-          {% endif %}
-        availability: "{{ states('sensor.load_power') not in ['unavailable', 'unknown'] }}"
+        availability: >-
+          {%- set deadline = states('input_datetime.charge_deadline') -%}
+          {{ has_value('sensor.load_power') and
+             has_value('input_datetime.charge_deadline') and
+             (now() >= today_at('23:30:00') or now() < today_at(deadline)) }}
+        state: "{{ states('sensor.load_power') | float(0) | round(3) }}"
 
+      # Wrappers around the statistics sensors — kept for downstream consistency.
+      # Availability propagates from the raw stats so downstream discharge
+      # timing doesn't silently treat "no data" as "zero load".
       - name: "Average Evening Load kW"
         unique_id: average_evening_load_kw
         unit_of_measurement: "kW"
         device_class: power
-        state: "{{ (states('sensor.average_evening_load_raw') | float(0)) | round(3) }}"
+        availability: "{{ has_value('sensor.average_evening_load_raw') }}"
+        state: "{{ states('sensor.average_evening_load_raw') | float(0) | round(3) }}"
 
       - name: "Average Overnight Load kW"
         unique_id: average_overnight_load_kw
         unit_of_measurement: "kW"
         device_class: power
-        state: "{{ (states('sensor.average_overnight_load_raw') | float(0)) | round(3) }}"
+        availability: "{{ has_value('sensor.average_overnight_load_raw') }}"
+        state: "{{ states('sensor.average_overnight_load_raw') | float(0) | round(3) }}"
 
-      # ==== Money / ROI ====
-      - name: "Daily Export Revenue"
-        unique_id: daily_export_revenue
-        unit_of_measurement: "GBP"
-        device_class: monetary
-        state: "{{ (states('sensor.feed_in_energy_today') | float(0) * 0.15) | round(2) }}"
-
+      # -----------------------------------------------------------------------
+      # FINANCIAL TRACKING (using tunable rate helpers, with live export rate)
+      # availability: clauses guard against post-restart races where the
+      # template engine evaluates before source entities are registered and
+      # gets stuck on `unavailable`.
+      # -----------------------------------------------------------------------
       - name: "Daily Import Cost Avoided"
         unique_id: daily_import_cost_avoided
         unit_of_measurement: "GBP"
         device_class: monetary
-        state: "{{ (states('sensor.daily_battery_discharge') | float(0) * 0.287) | round(2) }}"
+        availability: >-
+          {{ has_value('sensor.daily_battery_discharge') and
+             has_value('input_number.peak_import_rate_estimate') }}
+        state: >-
+          {# Battery discharge during peak avoided importing at peak rate #}
+          {% set discharged = states('sensor.daily_battery_discharge') | float(0) %}
+          {% set peak_rate = states('input_number.peak_import_rate_estimate') | float(0.287) %}
+          {{ (discharged * peak_rate) | round(2) }}
+
+      - name: "Daily Battery Arbitrage Profit"
+        unique_id: daily_battery_arbitrage_profit
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        availability: >-
+          {{ has_value('sensor.daily_battery_discharge') and
+             has_value('sensor.daily_battery_charge') and
+             has_value('input_number.peak_import_rate_estimate') and
+             has_value('input_number.off_peak_import_rate_estimate') }}
+        state: >-
+          {# True profit: discharge at peak - charge at off-peak (accounting for round-trip loss) #}
+          {% set discharged = states('sensor.daily_battery_discharge') | float(0) %}
+          {% set charged = states('sensor.daily_battery_charge') | float(0) %}
+          {% set peak_rate = states('input_number.peak_import_rate_estimate') | float(0.287) %}
+          {% set off_peak_rate = states('input_number.off_peak_import_rate_estimate') | float(0.052) %}
+          {{ ((discharged * peak_rate) - (charged * off_peak_rate)) | round(2) }}
+
+      - name: "Daily Export Revenue"
+        unique_id: daily_export_revenue
+        unit_of_measurement: "GBP"
+        device_class: monetary
+        availability: >-
+          {{ has_value('sensor.feed_in_energy_today') and
+             has_value('sensor.octopus_energy_electricity_<METER>_<MPAN_EXPORT>_export_current_rate') }}
+        state: >-
+          {% set kwh = states('sensor.feed_in_energy_today') | float(0) %}
+          {% set rate = states(
+            'sensor.octopus_energy_electricity_<METER>_<MPAN_EXPORT>_export_current_rate'
+          ) | float(0.12) %}
+          {{ (kwh * rate) | round(2) }}
 
       - name: "Total Daily Financial Gain"
         unique_id: total_daily_financial_gain
         unit_of_measurement: "GBP"
         device_class: monetary
-        state: >
-          {{ (states('sensor.daily_import_cost_avoided') | float(0)
-            + states('sensor.daily_export_revenue') | float(0)) | round(2)}}
+        availability: >-
+          {{ has_value('sensor.daily_battery_arbitrage_profit') and
+             has_value('sensor.daily_export_revenue') }}
+        state: >-
+          {{ ((states('sensor.daily_battery_arbitrage_profit') | float(0)) +
+              (states('sensor.daily_export_revenue') | float(0))) | round(2) }}
 
       - name: "Daily Net Profit"
         unique_id: daily_net_profit
         unit_of_measurement: "GBP"
         device_class: monetary
-        state: >
-          {{ (states('sensor.daily_export_revenue') | float(0)
-            - states('sensor.octopus_energy_electricity_<MPAN>_<METER>_current_accumulative_cost') | float(0)) | round(2)}}
+        availability: >-
+          {{ has_value('sensor.daily_export_revenue') and
+             has_value('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_cost') }}
+        state: >-
+          {% set export = states('sensor.daily_export_revenue') | float(0) %}
+          {% set import_cost = states(
+            'sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_cost'
+          ) | float(0) %}
+          {{ (export - import_cost) | round(2) }}
 
-      - name: "Current ROI Percentage"
-        unique_id: current_roi_percentage
-        unit_of_measurement: "%"
-        state: >
-          {% set total_gain = states('sensor.total_financial_gain_ytd') | float(0) %}
-          {% set investment = states('input_number.initial_solar_investment') | float(0) %}
-          {% if investment > 0 %} {{ (total_gain / investment * 100) | round(2) }} {% else %} 0 {% endif %}
+      # current_roi_percentage removed: its `total_financial_gain_lifetime`
+      # source was a non-monotonic monetary utility_meter, producing
+      # incorrect lifetime totals. Track lifetime gain via the Octopus cost
+      # tracker `_total_month` sensors instead, or rebuild this with a
+      # proper accumulator (input_number + nightly script) if needed.
 
+  # ---------------------------------------------------------------------------
+  # SAFETY MONITOR: Detect unwanted solar charging.
+  # Has to be a binary_sensor (not sensor) because device_class: problem only
+  # works on binary_sensors. Triggers an alert if the battery is being charged
+  # from solar during the day when it shouldn't be (export at 12p > grid charge
+  # at 5p, so solar→battery loses 7p/kWh).
+  # ---------------------------------------------------------------------------
+  - binary_sensor:
+      - name: "Battery Charging From Solar (Unwanted)"
+        unique_id: battery_charging_from_solar_unwanted
+        device_class: problem
+        state: >-
+          {% set charging = states('sensor.battery_charge') | float(0) > 0.1 %}
+          {% set off_peak = is_state(
+            'binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak', 'on') %}
+          {% set tesla_charging = is_state('binary_sensor.my_tesla_charging', 'on') %}
+          {% set perk_active = is_state('calendar.octopus_energy_a_<ACCOUNT>_greener_nights', 'on')
+                            or is_state('calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session', 'on') %}
+          {% set daytime = today_at('05:30:00') <= now() < today_at('23:30:00') %}
+          {% set pv_active = states('sensor.pv_power') | float(0) > 0.1 %}
+          {{ charging and not off_peak and not tesla_charging and not perk_active and daytime and pv_active }}
+
+# =============================================================================
+# STATISTICS SENSORS — 14-day rolling average load
+# Increased from 7 days to dampen single-day outliers
+# =============================================================================
 sensor:
   - platform: statistics
     name: "Average Evening Load Raw"
@@ -254,25 +419,25 @@ sensor:
     entity_id: sensor.current_evening_load_power_kw
     state_characteristic: mean
     max_age:
-      days: 7
+      days: 14
+
   - platform: statistics
     name: "Average Overnight Load Raw"
     unique_id: average_overnight_load_raw
     entity_id: sensor.current_overnight_load_power_kw
     state_characteristic: mean
     max_age:
-      days: 7
+      days: 14
 
+# =============================================================================
+# UTILITY METERS
+# =============================================================================
 utility_meter:
   daily_battery_charge:
     source: sensor.battery_charge_today
-    name: Daily Battery Charge
+    name: "Daily Battery Charge"
     cycle: daily
   daily_battery_discharge:
     source: sensor.battery_discharge_today
-    name: Daily Battery Discharge
+    name: "Daily Battery Discharge"
     cycle: daily
-  total_financial_gain_ytd:
-    source: sensor.total_daily_financial_gain
-    name: "Total Financial Gain YTD"
-    cycle: yearly

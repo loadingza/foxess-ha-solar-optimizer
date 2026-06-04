@@ -1,8 +1,52 @@
-# ==============================================================================
-# === SYSTEM STATE & MODE CONTROL ==============================================
-# ==============================================================================
-- id: solar_set_daytime_feed_in_mode
-  alias: System - Set Daytime Feed-in First Mode
+# =============================================================================
+# FoxESS + Octopus solar/battery optimizer — automations
+# Octopus IDs sanitized: <METER> <MPAN> <MPAN_EXPORT> a_<ACCOUNT> <INTELLIGENT_DEVICE>
+# Replace with your own from Developer Tools -> States.
+# =============================================================================
+- id: 'system_sync_inverter_soc_limits'
+  alias: 'System: Sync Inverter SoC Limits'
+  description: >
+    Pushes battery_max_soc and battery_min_soc to the inverter on HA start
+    or whenever the helpers change.
+  mode: queued
+  max: 5
+  trigger:
+    - platform: homeassistant
+      event: start
+    - platform: state
+      entity_id:
+        - input_number.battery_max_soc
+        - input_number.battery_min_soc
+  action:
+    - delay: '00:00:10'  # Allow inverter integration to fully load on HA start
+    - service: number.set_value
+      target:
+        entity_id: number.max_soc
+      data:
+        value: "{{ states('input_number.battery_max_soc') | float(95) }}"
+    - service: number.set_value
+      target:
+        entity_id: number.min_soc
+      data:
+        value: "{{ states('input_number.battery_min_soc') | float(15) }}"
+    - service: number.set_value
+      target:
+        entity_id: number.min_soc_on_grid
+      data:
+        value: "{{ states('input_number.battery_min_soc') | float(15) }}"
+
+# =============================================================================
+# SECTION 2: DAYTIME DEFAULT MODE (FEED-IN FIRST)
+# =============================================================================
+
+# At 05:30 (off-peak window ends), set inverter to Feed-in First so that
+# solar exports to grid rather than charging the battery.
+- id: 'system_set_daytime_feed_in_first_mode'
+  alias: 'System: Set Daytime Feed-in First Mode'
+  description: >
+    At 05:30 or HA restart during daytime, ensure the inverter is in
+    Feed-in First mode unless we're in a special state (Tesla charging,
+    smart dispatch, critically low battery).
   mode: single
   trigger:
     - platform: time
@@ -15,41 +59,495 @@
       state: 'on'
     - condition: time
       after: '05:30:00'
+      before: '23:29:59'
+    # Don't override Force Charge during the planned off-peak window
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
+    # Don't override Force Charge during a smart dispatch
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_<INTELLIGENT_DEVICE>_intelligent_dispatching
+      state: 'off'
+    # Don't override Force Charge if Tesla is mid-charge during peak
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'off'
+    # Don't override Force Charge / Back-up owned by an active perk window
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
   action:
-    - service: script.turn_on
-      target:
-        entity_id: script.set_feed_in_first_mode
+    - choose:
+        # Critically low battery: protect it (Self-Use lets PV trickle-charge
+        # to keep above the floor; the 7p/kWh loss is worth avoiding deep DoD)
+        - conditions:
+            - condition: numeric_state
+              entity_id: sensor.battery_soc
+              below: 12
+          sequence:
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Self Use'
+      default:
+        - service: script.turn_on
+          target:
+            entity_id: script.set_feed_in_first_mode
 
-# ==============================================================================
-# === PEAK TIME DISCHARGE LOGIC (EVENING) ======================================
-# ==============================================================================
-- id: battery_execute_dynamic_evening_discharge
-  alias: Battery - Execute Dynamic Evening Discharge
+# =============================================================================
+# SECTION 3: OFF-PEAK CHARGING (PLANNED + SMART DISPATCHES)
+# =============================================================================
+
+# Engage Force Charge whenever the off-peak sensor goes on.
+# For dispatches outside the planned window, only engage if Tesla is also
+# being smart-dispatched (avoids cycling the battery for marginal saving).
+- id: 'battery_off_peak_charge_start'
+  alias: 'Battery: Start Off-Peak Charge'
+  description: >
+    Triggered when off-peak goes on (planned window OR smart dispatch).
+    30s debounce guards against IOG flicker (seen as multiple on/off pulses
+    in dispatch history on 17 Apr).
   mode: single
   trigger:
-    - platform: time_pattern
-      seconds: "/3"
+    - platform: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      to: 'on'
+      for:
+        seconds: 30
   condition:
     - condition: state
       entity_id: input_boolean.fox_remote_control_enabled
       state: 'on'
     - condition: template
-      value_template: "{{ now() >= states('sensor.calculated_dynamic_discharge_start_time') | as_datetime | as_local }}"
-    - condition: time
-      before: '23:30:00'
-    # numeric_state cannot compare to another entity: use template
-    - condition: template
-      value_template: >
-        {{ states('sensor.battery_soc') | float(0)
-           > states('input_number.battery_hard_soc_floor') | float(10) }}
+      value_template: >-
+        {{ (states('sensor.battery_soc') | float(0)) <
+           (states('input_number.battery_max_soc') | float(95)) }}
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'on'
+    # Single source of truth: planned overnight window OR genuine Tesla
+    # smart dispatch (see binary_sensor definition in configuration.yaml).
+    - condition: state
+      entity_id: binary_sensor.battery_charge_window_active
+      state: 'on'
   action:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - delay: '00:00:02'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: "{{ [states('sensor.required_dynamic_charge_power_kw') | float(2.5), 5.0] | min }}"
+
+# Adjust the charge rate every 5 minutes during off-peak so we land at
+# max_soc near the deadline rather than overshooting early.
+- id: 'battery_off_peak_charge_regulate'
+  alias: 'Battery: Regulate Off-Peak Charge Power'
+  description: >
+    Recalculates required charge power every 5 minutes based on remaining
+    time and SoC gap. Only runs while in Force Charge during off-peak.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'on'
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Force Charge'
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.battery_soc') | float(0)) <
+           (states('input_number.battery_max_soc') | float(95)) }}
+  action:
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: "{{ [states('sensor.required_dynamic_charge_power_kw') | float(2.5), 5.0] | min }}"
+
+# Stop Force Charge when off-peak ends or at the deadline. Note we do NOT
+# revert on SoC reaching max: during off-peak that creates a bistable
+# oscillation (Feed-in First drains the battery to cover overnight house
+# load → SoC drops → recover heartbeat re-engages Force Charge → repeats
+# every ~10-20 min, observed 28 Apr 2026). Letting Force Charge stay
+# active at max is harmless — BMS limits current, no extra grid draw —
+# and it prevents the battery from leaking to cover house load on cheap
+# overnight rates.
+- id: 'battery_off_peak_charge_stop'
+  alias: 'Battery: Stop Off-Peak Charge'
+  description: >
+    Reverts inverter to Feed-in First when off-peak ends or charge
+    deadline arrives. The off-peak-end trigger (with 30s debounce)
+    closes the gap that previously left the inverter stuck in Force
+    Charge after mid-day smart dispatches ended.
+  mode: single
+  trigger:
+    - platform: time
+      at: input_datetime.charge_deadline
+    - platform: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      to: 'off'
+      for:
+        seconds: 30
+  condition:
+    # Safety cleanup runs regardless of fox_remote_control_enabled. Reason:
+    # leaving the inverter in Force Charge into peak rates costs real £.
+    # Manual operators should put the inverter into a non-Force-Charge mode
+    # before disabling remote control if they want this to be skipped.
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Force Charge'
+    # Don't stop if Tesla is charging during peak — let the Tesla peak assist
+    # logic manage the mode in that case
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'off'
+    # Greener Nights / Free Electricity perks own Force Charge during their
+    # windows — let their stop automations release.
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+  action:
+    - service: script.turn_on
+      target:
+        entity_id: script.set_feed_in_first_mode
+
+# Self-healing: if we're somehow not in Force Charge during off-peak with
+# room to charge, recover. Mirrors battery_off_peak_charge_start's gating:
+#   * Only inside the planned overnight window (23:30 → charge_deadline) OR
+#   * A smart dispatch is active AND Tesla is dispatching (so dispatched
+#     energy benefits Tesla, not a pointless battery cycle).
+# This stops the recover from racing the deadline (off_peak stays "on"
+# until 05:25 but charge_deadline can be earlier) and from forcing a
+# mid-day smart-dispatch cycle that the start would have refused.
+- id: 'battery_off_peak_charge_recover'
+  alias: 'Battery: Recover Off-Peak Charge State'
+  description: 'Periodically enforces Force Charge during off-peak if not already set'
+  mode: single
+  trigger:
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'on'
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.battery_soc') | float(0)) <
+           (states('input_number.battery_max_soc') | float(95) - 1) }}
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Force Charge'
+    # Match the start automation via the single source of truth.
+    - condition: state
+      entity_id: binary_sensor.battery_charge_window_active
+      state: 'on'
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "Battery State Recovery"
+        message: >-
+          Inverter was in {{ states('select.work_mode') }} during off-peak with
+          SoC {{ states('sensor.battery_soc') }}%. Recovering to Force Charge.
+        notification_id: "battery_state_recovery"
+    - repeat:
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: select.work_mode
+            data:
+              option: 'Force Charge'
+          - delay:
+              seconds: 15
+        until:
+          # Stop after the inverter confirms Force Charge OR after 3 attempts
+          - "{{ repeat.index >= 3 or is_state('select.work_mode', 'Force Charge') }}"
+
+# Closes the gap exposed when:
+#   off-peak is on (smart dispatch) AND Tesla is charging AND battery is
+#   already at/near max_soc. battery_off_peak_charge_start has SoC<max
+#   condition, so Force Charge never engages, inverter stays in Feed-in
+#   First, and the inverter's ~9.2 kW grid pass-through (40 A × 230 V)
+#   gets exceeded by Tesla + house — battery drains to fill the gap with
+#   no arbitrage benefit since grid power is already cheap.
+# Switch to Back-up: battery sits idle, grid fully covers Tesla.
+- id: 'battery_dispatch_protect_when_full'
+  alias: 'Battery: Protect During Tesla Dispatch (Battery Full)'
+  description: >
+    Switches to Back-up when off-peak is active AND Tesla is charging
+    AND battery SoC is at/near max_soc. Stops the battery from filling
+    the inverter pass-through gap during cheap grid windows.
+  mode: single
+  trigger:
+    # Off-peak begins while Tesla is already charging and battery is full
+    - platform: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      to: 'on'
+      for:
+        seconds: 30
+    # Tesla starts charging mid-dispatch with battery already full
+    - platform: state
+      entity_id: binary_sensor.my_tesla_charging
+      to: 'on'
+      for:
+        seconds: 30
+    # Battery finishes charging during a Tesla dispatch
+    - platform: numeric_state
+      entity_id: sensor.battery_soc
+      above: 93
+      for:
+        seconds: 60
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'on'
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.battery_soc') | float(0)) >=
+           (states('input_number.battery_max_soc') | float(95) - 2) }}
+    - condition: not
+      conditions:
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Back-up'
+  action:
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Back-up'
+    - service: persistent_notification.create
+      data:
+        title: "Battery Protected From Tesla Dispatch"
+        message: >-
+          Tesla charging on cheap grid (off-peak/IOG) with battery at
+          {{ states('sensor.battery_soc') }}%. Inverter set to Back-up
+          to keep grid covering Tesla load — no battery cycle.
+        notification_id: "battery_dispatch_protect"
+
+# Revert from Back-up when the protective conditions clear (off-peak ends
+# OR Tesla stops). The existing battery_off_peak_charge_stop only reverts
+# from Force Charge, so this handles the Back-up case explicitly.
+# Also runs as a 5-minute heartbeat so a stuck Back-up state self-heals
+# within 5 minutes regardless of how we got there (e.g. automation
+# reload missing a state transition, manual override, HA restart).
+- id: 'battery_dispatch_release_back_up'
+  alias: 'Battery: Release From Back-up When Dispatch / Tesla Ends'
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      to: 'off'
+      for:
+        seconds: 30
+    - platform: state
+      entity_id: binary_sensor.my_tesla_charging
+      to: 'off'
+      for:
+        seconds: 30
+    # Heartbeat so a stuck Back-up state self-heals
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: select.work_mode
+      state: 'Back-up'
+    # Don't fight other Back-up owners — those automations have their own
+    # start/stop logic. (Greener Nights + Free Electricity intentionally
+    # hold Back-up when full to prevent house-load drain.)
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+    # Only release when at least one protective condition is no longer true
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+          state: 'off'
+        - condition: state
+          entity_id: binary_sensor.my_tesla_charging
+          state: 'off'
+  action:
+    # Four-way priority order:
+    #   1. Off-peak on + SoC room → Force Charge (don't waste cheap window)
+    #   2. Off-peak on + full     → stay Back-up (lock against drain)
+    #   3. Tesla still charging   → Force Charge (peak assist owns mode)
+    #   4. Otherwise              → release to Feed-in First
     - choose:
         - conditions:
-            # Compare load (kW) to target discharge (kW)
+            - condition: state
+              entity_id: binary_sensor.battery_charge_window_active
+              state: 'on'
             - condition: template
-              value_template: >
-                {{ (states('sensor.load_power') | float(0) / 1000)
-                    > (states('input_number.target_discharge_rate_kw') | float(0)) }}
+              value_template: >-
+                {{ (states('sensor.battery_soc') | float(0)) <
+                   (states('input_number.battery_max_soc') | float(95)) }}
+          sequence:
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Force Charge'
+            - delay: '00:00:02'
+            - service: number.set_value
+              target:
+                entity_id: number.force_charge_power
+              data:
+                value: "{{ [states('sensor.required_dynamic_charge_power_kw') | float(2.5), 5.0] | min }}"
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.battery_charge_window_active
+              state: 'on'
+          sequence:
+            # Charge window still owns the inverter but battery is full —
+            # stay in Back-up to prevent overnight house load draining the
+            # battery into 5p territory.
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Back-up'
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.my_tesla_charging
+              state: 'on'
+          sequence:
+            # Tesla still charging during peak — keep battery in Force
+            # Charge. Set power immediately (don't wait for the Tesla peak-
+            # assist 30s heartbeat). Use the SAME SoC-aware rate as the
+            # peak-assist automations so behaviour matches everywhere.
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Force Charge'
+            - delay: '00:00:02'
+            - service: number.set_value
+              target:
+                entity_id: number.force_charge_power
+              data:
+                value: >-
+                  {% set soc = states('sensor.battery_soc') | float(0) %}
+                  {% set assist_min = states('input_number.tesla_peak_assist_min_soc') | float(30) %}
+                  {% if soc < assist_min %}
+                    0.5
+                  {% else %}
+                    {{ [states('sensor.planned_average_charge_rate') | float(2.5), 5.0] | min }}
+                  {% endif %}
+      default:
+        - service: script.turn_on
+          target:
+            entity_id: script.set_feed_in_first_mode
+
+# =============================================================================
+# SECTION 4: EVENING PEAK DISCHARGE
+# =============================================================================
+
+# Dynamic discharge: Force Discharge to export grid at target rate when
+# home load is low; switch to Feed-in First when load exceeds target so
+# we serve the home from battery rather than importing.
+#
+# CRITICAL FIX vs original: load_power is in kW, not W. The original
+# template multiplied target by 1000, so the comparison never triggered
+# the high-load branch.
+- id: 'battery_evening_discharge_dynamic'
+  alias: 'Battery: Dynamic Evening Discharge'
+  description: >
+    Runs every 30s during the evening discharge window. Uses load-aware
+    hysteresis to switch between Force Discharge (low load → export) and
+    Feed-in First (high load → serve home) without flapping.
+  mode: single
+  trigger:
+    - platform: time_pattern
+      seconds: "/30"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    # Without live load telemetry we can't make a safe Force/Feed-in choice,
+    # so skip the cycle entirely (the once-per-30s trigger will retry).
+    - condition: template
+      value_template: "{{ has_value('sensor.load_power') }}"
+    - condition: template
+      value_template: >-
+        {% set start = states('sensor.calculated_dynamic_discharge_start_time') %}
+        {% if start in ['unknown', 'unavailable', '', none] %}
+          false
+        {% else %}
+          {{ now() >= (start | as_datetime | as_local) }}
+        {% endif %}
+    - condition: time
+      before: '23:30:00'
+    # Respect the discharge floor
+    - condition: template
+      value_template: >-
+        {{ (states('sensor.battery_soc') | float(0)) >
+           (states('input_number.battery_discharge_soc_target') | float(20)) }}
+    # Never discharge while EV is charging (Tesla peak assist owns the mode)
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'off'
+    # Don't override an active off-peak / smart dispatch
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
+    # Don't override active perk windows
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+  action:
+    - choose:
+        # HIGH LOAD: home load exceeds target → switch to Feed-in First so
+        # battery serves the home (avoids importing from grid)
+        - conditions:
+            - condition: template
+              value_template: >-
+                {% set load = states('sensor.load_power') | float(0) %}
+                {% set target = states('input_number.target_discharge_rate_kw') | float(2.5) %}
+                {% set mode = states('select.work_mode') %}
+                {% if mode == 'Force Discharge' %}
+                  {# Hysteresis: only switch up to Feed-in First at 115% of target #}
+                  {{ load > (target * 1.15) }}
+                {% else %}
+                  {{ load > target }}
+                {% endif %}
           sequence:
             - if:
                 - condition: not
@@ -61,115 +559,91 @@
                 - service: script.turn_on
                   target:
                     entity_id: script.set_feed_in_first_mode
+      # LOW LOAD: home load below target → Force Discharge for export
       default:
-        - if:
-            - condition: not
-              conditions:
-                - condition: state
-                  entity_id: select.work_mode
-                  state: 'Force Discharge'
-          then:
-            - service: select.select_option
-              target:
-                entity_id: select.work_mode
-              data:
-                option: 'Force Discharge'
-        - service: number.set_value
-          target:
-            entity_id: number.force_discharge_power
-          data:
-            value: "{{ states('input_number.target_discharge_rate_kw') | float(2.5) }}"
+        - choose:
+            - conditions:
+                - condition: template
+                  value_template: >-
+                    {% set load = states('sensor.load_power') | float(0) %}
+                    {% set target = states('input_number.target_discharge_rate_kw') | float(2.5) %}
+                    {% set mode = states('select.work_mode') %}
+                    {% if mode == 'Feed-in First' %}
+                      {# Hysteresis: only drop back to Force Discharge at 85% of target #}
+                      {{ load < (target * 0.85) }}
+                    {% else %}
+                      {{ true }}
+                    {% endif %}
+              sequence:
+                - if:
+                    - condition: not
+                      conditions:
+                        - condition: state
+                          entity_id: select.work_mode
+                          state: 'Force Discharge'
+                  then:
+                    - service: select.select_option
+                      target:
+                        entity_id: select.work_mode
+                      data:
+                        option: 'Force Discharge'
+                - service: number.set_value
+                  target:
+                    entity_id: number.force_discharge_power
+                  data:
+                    value: "{{ [states('input_number.target_discharge_rate_kw') | float(2.5), 5.0] | min }}"
 
-# ==============================================================================
-# === OFF-PEAK CHARGE LOGIC (NIGHT) ============================================
-# ==============================================================================
-- id: battery_execute_off_peak_grid_charge
-  alias: Battery - Execute Off-Peak Grid Charge (Starter)
+# Belt-and-suspenders guard: anywhere the inverter is in Force Discharge,
+# switch to Feed-in First if home load exceeds target × 1.15 for 30s.
+# battery_evening_discharge_dynamic already handles this during the
+# evening window; this catches every other case (manual discharge, future
+# automations, etc.) so you never end up exporting at 12p while importing
+# at 28.7p to cover the same load.
+- id: 'battery_force_discharge_load_guard'
+  alias: 'Battery: Force Discharge Load Guard (24/7)'
+  description: >
+    Switches Force Discharge → Feed-in First when home load exceeds
+    target_discharge_rate × 1.15 for 30s. No window restriction so it
+    works outside evening discharge too.
   mode: single
   trigger:
-    # Start at beginning of off-peak
-    - platform: state
-      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
-      to: 'on'
-    # Restart-safe: wait until SoC is stable post-restart
-    - platform: state
-      entity_id: sensor.battery_soc
+    - platform: template
+      value_template: >-
+        {{ is_state('select.work_mode', 'Force Discharge') and
+           (states('sensor.load_power') | float(0)) >
+           ((states('input_number.target_discharge_rate_kw') | float(2.5)) * 1.15) }}
       for:
-        seconds: 15
+        seconds: 30
   condition:
     - condition: state
       entity_id: input_boolean.fox_remote_control_enabled
       state: 'on'
-    - condition: numeric_state
-      entity_id: sensor.battery_soc
-      below: 90
+    # Don't fight off-peak charging logic
     - condition: state
-      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
-      state: 'on'
-  action:
-    - service: select.select_option
-      target:
-        entity_id: select.work_mode
-      data:
-        option: 'Force Charge'
-    - delay: '00:00:02'
-    - service: automation.trigger
-      target:
-        entity_id: automation.battery_regulate_off_peak_charge_power
-
-- id: battery_regulate_off_peak_charge_power
-  alias: Battery - Regulate Off-Peak Charge Power
-  mode: single
-  trigger:
-    - platform: time_pattern
-      minutes: "/1"
-  condition:
-    - condition: state
-      entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
-      state: 'on'
-    - condition: state
-      entity_id: select.work_mode
-      state: 'Force Charge'
-    - condition: numeric_state
-      entity_id: sensor.battery_soc
-      below: 90
-  action:
-    - service: number.set_value
-      target:
-        entity_id: number.force_charge_power
-      data:
-        value: "{{ states('sensor.required_dynamic_charge_power') | float(0) }}"
-
-- id: battery_stop_off_peak_charge
-  alias: Battery - Stop Off-Peak Charge
-  mode: single
-  trigger:
-    - platform: numeric_state
-      entity_id: sensor.battery_soc
-      above: 90
-    - platform: time
-      at: input_datetime.charge_deadline
-  condition:
-    - condition: state
-      entity_id: select.work_mode
-      state: 'Force Charge'
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
   action:
     - service: script.turn_on
       target:
         entity_id: script.set_feed_in_first_mode
-    - delay: '00:00:02'
-    - service: number.set_value
-      target:
-        entity_id: number.force_charge_power
-      data:
-        value: 0
 
-# ==============================================================================
-# === PEAK EV CHARGING - START BATTERY CHARGE ==================================
-# ==============================================================================
-- id: solar_peak_ev_charge_assist_start
-  alias: Solar: START Force Charge when Tesla charges during peak hours
-  description: When the Tesla starts charging between 05:30–23:30, force charge the battery at 2.5 kW from the grid.
+# =============================================================================
+# SECTION 5: TESLA PEAK CHARGING ASSIST
+# =============================================================================
+# When Tesla charges during peak hours, hold the home battery level by
+# putting the inverter into Force Charge — this prevents the home battery
+# from being drained at peak rates to feed the Tesla.
+#
+# If SoC is below the assist threshold (default 30%), we use a low Force
+# Charge rate to hold the level rather than skip entirely (the original
+# config did nothing in this case, leaving the battery exposed).
+# =============================================================================
+
+- id: 'tesla_peak_assist_start'
+  alias: 'Tesla: Start Peak Assist (Force Charge)'
+  description: >
+    When Tesla starts charging during peak hours, set inverter to Force
+    Charge to prevent the home battery being drained.
   mode: single
   trigger:
     - platform: state
@@ -182,89 +656,562 @@
     - condition: time
       after: '05:30:00'
       before: '23:30:00'
-    - condition: numeric_state
-      entity_id: sensor.battery_soc
-      below: 90
+    # Don't engage during a smart dispatch — off_peak charging logic owns it
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
+    # Don't engage during an active perk window — perks own the mode
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
   action:
     - service: select.select_option
       target:
         entity_id: select.work_mode
       data:
         option: 'Force Charge'
+    - delay: '00:00:01'
     - service: number.set_value
       target:
         entity_id: number.force_charge_power
       data:
-        value: 2.5   # kW
+        value: >-
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% set assist_min = states('input_number.tesla_peak_assist_min_soc') | float(30) %}
+          {% if soc < assist_min %}
+            {# Low SoC: minimal hold rate to prevent drain without big peak buy-in #}
+            0.5
+          {% else %}
+            {{ [states('sensor.planned_average_charge_rate') | float(2.5), 5.0] | min }}
+          {% endif %}
 
-# ==============================================================================
-# === PEAK EV CHARGING - STOP BATTERY CHARGE ===================================
-# ==============================================================================
-- id: solar_peak_ev_charge_assist_stop
-  alias: Solar: STOP Force Charge when Tesla stops or peak window ends
-  description: Reverts the inverter to Feed-in First when EV charging stops or at 23:30.
+- id: 'tesla_peak_assist_heartbeat'
+  alias: 'Tesla: Peak Assist Heartbeat'
+  description: >
+    Periodically re-asserts Force Charge while Tesla is charging during
+    peak (covers cases where another automation flipped the mode).
+  mode: single
+  trigger:
+    - platform: time_pattern
+      seconds: "/30"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: time
+      after: '05:30:00'
+      before: '23:30:00'
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
+    # Don't fight perks owning Back-up
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+  action:
+    - choose:
+        - conditions:
+            - condition: not
+              conditions:
+                - condition: state
+                  entity_id: select.work_mode
+                  state: 'Force Charge'
+          sequence:
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Force Charge'
+    - service: number.set_value
+      target:
+        entity_id: number.force_charge_power
+      data:
+        value: >-
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% set assist_min = states('input_number.tesla_peak_assist_min_soc') | float(30) %}
+          {% if soc < assist_min %}
+            0.5
+          {% else %}
+            {{ [states('sensor.planned_average_charge_rate') | float(2.5), 5.0] | min }}
+          {% endif %}
+
+- id: 'tesla_peak_assist_stop'
+  alias: 'Tesla: Stop Peak Assist'
+  description: >
+    Reverts to Feed-in First when Tesla stops charging during peak hours.
   mode: single
   trigger:
     - platform: state
       entity_id: binary_sensor.my_tesla_charging
       to: 'off'
-    - platform: time
-      at: '23:30:00'
   condition:
     - condition: state
       entity_id: select.work_mode
       state: 'Force Charge'
+    - condition: time
+      after: '05:30:00'
+      before: '23:30:00'
+    # Don't revert if a smart dispatch / off-peak window is active
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
   action:
     - service: script.turn_on
       target:
         entity_id: script.set_feed_in_first_mode
+
+# If HA restarts mid-Tesla-charge, re-engage assist
+- id: 'tesla_peak_assist_enforce_on_restart'
+  alias: 'Tesla: Enforce Peak Assist on HA Restart'
+  description: >
+    On HA start, if Tesla is already charging during peak hours, engage
+    the assist Force Charge mode immediately.
+  mode: single
+  trigger:
+    - platform: homeassistant
+      event: start
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'on'
+    - condition: time
+      after: '05:30:00'
+      before: '23:30:00'
+    - condition: state
+      entity_id: binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak
+      state: 'off'
+    # Defer to active perks
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+  action:
+    - delay: '00:00:15'
+    - service: select.select_option
+      target:
+        entity_id: select.work_mode
+      data:
+        option: 'Force Charge'
+    - delay: '00:00:01'
     - service: number.set_value
       target:
         entity_id: number.force_charge_power
       data:
-        value: 0
+        value: >-
+          {% set soc = states('sensor.battery_soc') | float(0) %}
+          {% set assist_min = states('input_number.tesla_peak_assist_min_soc') | float(30) %}
+          {% if soc < assist_min %}
+            0.5
+          {% else %}
+            {{ [states('sensor.planned_average_charge_rate') | float(2.5), 5.0] | min }}
+          {% endif %}
 
-# ==============================================================================
-# === SYSTEM STATE RECOVERY (SELF-HEALING) =====================================
-# ==============================================================================
-- id: battery_recover_off_peak_charge_state
-  alias: System - Recover Off-Peak Charge State
-  description: Periodically enforces Force Charge during off-peak if the battery is not full.
+# =============================================================================
+# SECTION 6: SAFETY MONITORING
+# =============================================================================
+
+# Alert if the battery starts charging from solar during the day. With your
+# tariff (12p export, 5p off-peak charge) this would be a 7p/kWh loss.
+- id: 'safety_alert_unwanted_solar_charging'
+  alias: 'Safety: Alert on Unwanted Solar Charging'
+  description: >
+    Notifies if the battery is being charged from solar during daytime
+    when it shouldn't be (export at 12p > grid charge at 5p).
   mode: single
   trigger:
-    - platform: time_pattern
-      minutes: "/5"
-  condition:
-    - condition: and
-      conditions:
-        - condition: state
-          entity_id: binary_sensor.octopus_energy_electricity_<MPAN>_<METER>_off_peak
-          state: 'on'
-        - condition: numeric_state
-          entity_id: sensor.battery_soc
-          below: 90
-        - condition: not
-          conditions:
-            - condition: state
-              entity_id: select.work_mode
-              state: 'Force Charge'
-        - condition: state
-          entity_id: input_boolean.fox_remote_control_enabled
-          state: 'on'
+    - platform: state
+      entity_id: binary_sensor.battery_charging_from_solar_unwanted
+      to: 'on'
+      for:
+        minutes: 2
   action:
     - service: persistent_notification.create
       data:
-        title: "Solar System State Recovery"
-        message: >
-          Inverter was in the wrong mode ({{ states('select.work_mode') }})
-          during off-peak. Setting 'Force Charge'. SoC: {{ states('sensor.battery_soc') }}%.
-        notification_id: "solar_state_recovery"
-    - repeat:
-        count: 3
-        sequence:
-          - service: select.select_option
-            target:
-              entity_id: select.work_mode
-            data:
-              option: 'Force Charge'
-          - delay: "00:00:15"
+        title: "⚠️ Unwanted Solar Charging Detected"
+        message: >-
+          The battery is charging from solar during daytime. Current state:
+          mode={{ states('select.work_mode') }},
+          battery_charge={{ states('sensor.battery_charge') }} kW,
+          PV={{ states('sensor.pv_power') }} kW,
+          SoC={{ states('sensor.battery_soc') }}%.
+          With 12p export vs 5p import, this is losing ~7p/kWh.
+        notification_id: "unwanted_solar_charging"
+
+# Alert if the inverter remains in Force Charge during peak rates without
+# a legitimate reason. Defense-in-depth against battery_off_peak_charge_stop
+# failing — at ~28.7p/kWh peak vs ~5p off-peak, every minute stuck imports
+# at a 23p/kWh premium.
+- id: 'safety_alert_stuck_in_force_charge'
+  alias: 'Safety: Alert on Stuck Force Charge'
+  description: >
+    Notifies if the inverter has been in Force Charge for 5+ minutes outside
+    the off-peak window with no Tesla charge in progress. Template trigger
+    so it fires for stuck states regardless of how we got there (off-peak
+    stop missed the transition, HA restarted mid-charge, manual override).
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >-
+        {{ is_state('select.work_mode', 'Force Charge')
+           and is_state('binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak', 'off')
+           and is_state('binary_sensor.my_tesla_charging', 'off')
+           and is_state('calendar.octopus_energy_a_<ACCOUNT>_greener_nights', 'off')
+           and is_state('calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session', 'off') }}
+      for:
+        minutes: 5
+  condition:
+    # Only alert when our automations are supposed to own the mode
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "⚠️ Stuck in Force Charge"
+        message: >-
+          Inverter has been in Force Charge for 5+ minutes during peak rates
+          with no Tesla charge in progress. Current state:
+          rate={{ states('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_rate') }} GBP/kWh,
+          SoC={{ states('sensor.battery_soc') }}%,
+          battery_charge={{ states('sensor.battery_charge') }} kW,
+          grid_consumption={{ states('sensor.grid_consumption') }} kW.
+          Importing at peak — check battery_off_peak_charge_stop logic.
+        notification_id: "stuck_in_force_charge"
+
+# =============================================================================
+# SECTION 7: OCTOPUS PERKS (SAVING SESSIONS, GREENER NIGHTS, OCTOPLUS)
+# =============================================================================
+
+# Auto-join every Octoplus saving session as soon as it's published.
+# Saving sessions pay points (£) per kWh saved vs baseline during a peak
+# window — joining is always +EV; the battery+solar setup naturally beats
+# baseline without behaviour change.
+- id: 'octopus_auto_join_saving_session'
+  alias: 'Octopus: Auto-Join Saving Session'
+  description: >
+    Fires once per new saving session via the integration's event bus event
+    and joins it. Event-driven (vs polling) avoids re-iterating
+    available_events on every state change.
+  mode: queued
+  max: 10
+  trigger:
+    - platform: event
+      event_type: octopus_energy_new_octoplus_saving_session
+  action:
+    - service: octopus_energy.join_octoplus_saving_session_event
+      data:
+        event_code: "{{ trigger.event.data.event_code }}"
+      target:
+        entity_id: event.octopus_energy_a_<ACCOUNT>_octoplus_saving_session_events
+    - service: persistent_notification.create
+      data:
+        title: "🟢 Joined Octopus Saving Session"
+        message: >-
+          Joined session {{ trigger.event.data.event_code }}
+          starting {{ trigger.event.data.event_start }}
+          → {{ trigger.event.data.event_end }}
+          at {{ trigger.event.data.octopoints_per_kwh | default('?') }} pts/kWh.
+
+# Greener Nights are bonus off-peak windows that are NOT rolled into the
+# integration's off_peak binary_sensor. Trigger Force Charge when one starts
+# and stop when it ends, mirroring the planned-window behaviour.
+- id: 'octopus_greener_nights_charge_start'
+  alias: 'Octopus: Start / Maintain Charge on Greener Nights'
+  description: >
+    Force Charge if there's SoC room, else Back-up to lock cells against
+    overnight house-load drain during the bonus off-peak window. Runs on
+    calendar start AND a 5-min heartbeat so a battery that drains during
+    the session re-engages Force Charge.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      to: 'on'
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'on'
+    # Free Electricity has higher rebate value (~£3-15/kWh vs Greener
+    # Nights bonus rate); let it own the mode if it's active.
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+  action:
+    # Choose based on SoC AND whether Tesla is currently grid-charging
+    # (inverter pass-through caps near 9 kW — concurrent Force Charge at
+    # 5 kW + Tesla 7 kW would saturate it, so hold Back-up when Tesla
+    # owns the grid path).
+    - choose:
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.my_tesla_charging
+              state: 'on'
+          sequence:
+            - condition: template
+              value_template: "{{ not is_state('select.work_mode', 'Back-up') }}"
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Back-up'
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ (states('sensor.battery_soc') | float(0)) <
+                   (states('input_number.battery_max_soc') | float(95)) }}
+          sequence:
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Force Charge'
+            - delay: '00:00:02'
+            - service: number.set_value
+              target:
+                entity_id: number.force_charge_power
+              data:
+                value: "{{ [states('sensor.required_dynamic_charge_power_kw') | float(2.5), 5.0] | min }}"
+      default:
+        # Battery full and no Tesla conflict — hold Back-up so house load
+        # doesn't drain it during this bonus cheap window.
+        - condition: template
+          value_template: "{{ not is_state('select.work_mode', 'Back-up') }}"
+        - service: select.select_option
+          target:
+            entity_id: select.work_mode
+          data:
+            option: 'Back-up'
+
+- id: 'octopus_greener_nights_charge_stop'
+  alias: 'Octopus: Stop Force/Back-up on Greener Nights End'
+  description: >
+    Revert to Feed-in First when the Greener Nights window ends, unless
+    another legitimate owner is taking over (charge window, Free Electricity,
+    or Tesla). Handles BOTH Force Charge and Back-up modes.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      to: 'off'
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Force Charge'
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Back-up'
+    # No successor owner — use the canonical helper (planned window OR
+    # genuine Tesla dispatch) rather than the raw off_peak sensor.
+    - condition: state
+      entity_id: binary_sensor.battery_charge_window_active
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'off'
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'off'
+  action:
+    - service: script.set_feed_in_first_mode
+
+# Surface the daily cheapest windows as actionable phone notifications
+# so deferrable loads (dishwasher, laundry, hot water) can be started by hand.
+- id: 'octopus_notify_cheapest_3hr_window_start'
+  alias: 'Octopus: Notify Cheapest 3hr Window Start'
+  description: >
+    Notifies when the daily cheapest 3hr window begins. Targets dishwasher,
+    washing machine, EV top-up beyond the planned IOG slot.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.target_timeframes_event_octopus_energy_electricity_<METER>_<MPAN>_current_day_rates_cheapest_3hr_today
+      to: 'on'
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "⏰ Cheapest 3hr window started"
+        message: >-
+          Best 3hr import window of the day starts now @
+          £{{ states('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_rate') }}/kWh.
+          Run the dishwasher / washing machine now if you need to.
+
+- id: 'octopus_notify_cheapest_1hr_window_start'
+  alias: 'Octopus: Notify Cheapest 1hr Window Start'
+  description: >
+    Notifies when the daily cheapest 1hr window begins. Targets hot water
+    boost or any short, deferrable high-power task.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.target_timeframes_event_octopus_energy_electricity_<METER>_<MPAN>_current_day_rates_cheapest_1hr_today
+      to: 'on'
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "⏰ Cheapest 1hr window started"
+        message: >-
+          Cheapest single hour today is now @
+          £{{ states('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_rate') }}/kWh.
+          Good moment for a hot-water boost or quick high-draw load.
+
+- id: 'octopus_notify_greenest_grid_window'
+  alias: 'Octopus: Notify Greenest Grid Window Start'
+  description: >
+    Fires when the current half-hour forecast is flagged as highlighted
+    (cleanest grid). Triggered from the sensor's is_highlighted attribute
+    so we don't depend on the deprecated _highlighted binary_sensor.
+  mode: single
+  trigger:
+    - platform: template
+      value_template: >-
+        {{ state_attr('sensor.octopus_energy_a_<ACCOUNT>_greenness_forecast_current_index',
+                      'is_highlighted') | bool(false) }}
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "🌱 Greenest grid window now"
+        message: >-
+          Cleanest grid window starting — index
+          {{ states('sensor.octopus_energy_a_<ACCOUNT>_greenness_forecast_current_index') }}.
+          Good time for any flexible loads if you care about carbon over cost.
+
+# Free Electricity sessions: Octopus pays for everything you consume above
+# baseline during the session window. Force-charge battery to soak it up.
+# Triggered via the calendar entity (the binary_sensor equivalent is
+# deprecated by the integration).
+- id: 'octopus_free_electricity_charge_start'
+  alias: 'Octopus: Start / Maintain Charge on Free Electricity'
+  description: >
+    During a Free Electricity session: Force Charge if there's SoC room,
+    else hold Back-up to prevent any battery drain. Runs on calendar start
+    AND every 5 min so a draining battery re-engages mid-session.
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      to: 'on'
+    - platform: time_pattern
+      minutes: "/5"
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      state: 'on'
+  action:
+    - choose:
+        # Tesla actively charging — yield grid pass-through to Tesla,
+        # hold battery in Back-up (don't try to fit a 5 kW Force Charge
+        # under the ~9 kW inverter pass-through limit alongside it).
+        - conditions:
+            - condition: state
+              entity_id: binary_sensor.my_tesla_charging
+              state: 'on'
+          sequence:
+            - condition: template
+              value_template: "{{ not is_state('select.work_mode', 'Back-up') }}"
+            - service: select.select_option
+              target:
+                entity_id: select.work_mode
+              data:
+                option: 'Back-up'
+        - conditions:
+            - condition: template
+              value_template: >-
+                {{ (states('sensor.battery_soc') | float(0)) <
+                   (states('input_number.battery_max_soc') | float(95)) }}
+          sequence:
+            - if:
+                - condition: template
+                  value_template: "{{ not is_state('select.work_mode', 'Force Charge') }}"
+              then:
+                - service: select.select_option
+                  target:
+                    entity_id: select.work_mode
+                  data:
+                    option: 'Force Charge'
+                - service: persistent_notification.create
+                  data:
+                    title: "🆓 Free Electricity Session Started"
+                    message: >-
+                      Free Electricity active — force-charging at 5 kW
+                      to maximise rebate. SoC={{ states('sensor.battery_soc') }}%.
+            - delay: '00:00:02'
+            - service: number.set_value
+              target:
+                entity_id: number.force_charge_power
+              data:
+                value: 5.0
+      default:
+        # Battery full and no Tesla conflict — hold Back-up so house load
+        # doesn't drain it during the rebate window.
+        - condition: template
+          value_template: "{{ not is_state('select.work_mode', 'Back-up') }}"
+        - service: select.select_option
+          target:
+            entity_id: select.work_mode
+          data:
+            option: 'Back-up'
+
+- id: 'octopus_free_electricity_charge_stop'
+  alias: 'Octopus: Stop Force/Back-up on Free Electricity End'
+  description: >
+    Revert to Feed-in First when a Free Electricity session ends, unless the
+    normal off-peak sensor / Greener Nights / Tesla charging still needs it.
+    Handles BOTH Force Charge and Back-up modes (start can leave us in either
+    depending on SoC at session start).
+  mode: single
+  trigger:
+    - platform: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+      to: 'off'
+  condition:
+    - condition: state
+      entity_id: input_boolean.fox_remote_control_enabled
+      state: 'on'
+    - condition: or
+      conditions:
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Force Charge'
+        - condition: state
+          entity_id: select.work_mode
+          state: 'Back-up'
+    # No successor owner — use the canonical helper (planned window OR
+    # genuine Tesla dispatch) rather than the raw off_peak sensor.
+    - condition: state
+      entity_id: binary_sensor.battery_charge_window_active
+      state: 'off'
+    - condition: state
+      entity_id: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+      state: 'off'
+    - condition: state
+      entity_id: binary_sensor.my_tesla_charging
+      state: 'off'
+  action:
+    - service: script.set_feed_in_first_mode

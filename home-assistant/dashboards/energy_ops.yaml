@@ -1,0 +1,399 @@
+# =============================================================================
+# ENERGY OPS DASHBOARD
+# =============================================================================
+# Trimmed for visual breathing room. Single sections-view, ordered top-to-
+# bottom by what you check most often:
+#   Power Flow (always look first) → Now/Status → Money → Tonight's Plan →
+#   Controls (collapsed) → Trends (2 charts, not 4) → Health (only when
+#   something is off-nominal).
+# =============================================================================
+
+title: Energy Ops
+views:
+  - title: Energy
+    path: energy
+    icon: mdi:lightning-bolt
+    type: sections
+    max_columns: 3
+    dense_section_placement: true
+    sections:
+
+      # -----------------------------------------------------------------
+      # POWER FLOW — the hero card
+      # -----------------------------------------------------------------
+      - type: grid
+        column_span: 2
+        cards:
+          - type: custom:power-flow-card-plus
+            title: Live Power Flow
+            entities:
+              battery:
+                entity:
+                  consumption: sensor.battery_charge
+                  production: sensor.battery_discharge
+                state_of_charge: sensor.battery_soc
+                color_state_of_charge_value: true
+                show_state_of_charge: true
+                name: Battery
+              grid:
+                entity:
+                  consumption: sensor.grid_consumption
+                  production: sensor.feed_in
+                name: Grid
+              solar:
+                entity: sensor.pv_power
+                name: Solar
+              home:
+                entity: sensor.load_power
+                name: House
+            kw_decimals: 2
+            min_flow_rate: 0.5
+            max_flow_rate: 8
+            watt_threshold: 100
+            clickable_entities: true
+
+      # -----------------------------------------------------------------
+      # NOW — compact: gauge + mode + a one-line rate summary
+      # -----------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: gauge
+            entity: sensor.battery_soc
+            name: Battery
+            min: 0
+            max: 100
+            needle: true
+            severity:
+              green: 30
+              yellow: 15
+              red: 0
+            grid_options:
+              columns: 12
+              rows: 2
+          - type: tile
+            entity: select.work_mode
+            name: Inverter Mode
+            icon: mdi:state-machine
+            grid_options:
+              columns: 12
+              rows: 1
+          - type: markdown
+            content: |
+              {%- set buy = states('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_rate') | float(0) -%}
+              {%- set sell = states('sensor.octopus_energy_electricity_<METER>_<MPAN_EXPORT>_export_current_rate') | float(0.12) -%}
+              {%- set off = is_state('binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak','on') -%}
+              {%- set disp = is_state('binary_sensor.octopus_energy_<INTELLIGENT_DEVICE>_intelligent_dispatching','on') -%}
+              {%- set tesla = is_state('binary_sensor.my_tesla_charging','on') -%}
+
+              **Buy** {{ '%.1f'|format(buy*100) }}p · **Sell** {{ '%.1f'|format(sell*100) }}p
+              {%- if off %} · 🟢 off-peak{%- endif -%}
+              {%- if disp %} · ⚡ smart dispatch{%- endif -%}
+              {%- if tesla %} · 🚗 Tesla charging{%- endif %}
+            grid_options:
+              columns: 12
+              rows: 1
+
+      # -----------------------------------------------------------------
+      # MONEY — today, computed inline
+      # -----------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: markdown
+            content: |
+              {%- set imp_cost = states('sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_cost') | float(0) -%}
+              {%- set exp_kwh = states('sensor.feed_in_energy_today') | float(0) -%}
+              {%- set exp_rev = states('sensor.daily_export_revenue') | float(0) -%}
+              {%- set arb = states('sensor.daily_battery_arbitrage_profit') | float(0) -%}
+              {%- set net = states('sensor.daily_net_profit') | float(0) -%}
+
+              ## Today: **£{{ '%.2f' % net }}**
+              <small>net (sold − bought)</small>
+
+              | | |
+              |---|---|
+              | Sold | £{{ '%.2f' % exp_rev }} ({{ '%.1f' % exp_kwh }} kWh) |
+              | Bought | £{{ '%.2f' % imp_cost }} |
+              | Battery arbitrage | £{{ '%.2f' % arb }} |
+
+      # -----------------------------------------------------------------
+      # TONIGHT — schedule + status check, in one
+      # -----------------------------------------------------------------
+      - type: grid
+        cards:
+          - type: markdown
+            content: |
+              {%- set soc = states('sensor.battery_soc') | float(0) -%}
+              {%- set max_soc = states('input_number.battery_max_soc') | float(95) -%}
+              {%- set min_soc = states('input_number.battery_min_soc') | float(15) -%}
+              {%- set deadline = states('input_datetime.charge_deadline') -%}
+              {%- set rate = states('input_number.target_discharge_rate_kw') | float(2.5) -%}
+              {%- set usable = (20.72 * (max_soc - min_soc) / 100) | round(2) -%}
+              {%- set mode = states('select.work_mode') -%}
+              {%- set offpeak = is_state('binary_sensor.octopus_energy_electricity_<METER>_<MPAN>_off_peak','on') -%}
+              {%- set tesla = is_state('binary_sensor.my_tesla_charging','on') -%}
+              {%- set perk = is_state('calendar.octopus_energy_a_<ACCOUNT>_greener_nights','on') or
+                              is_state('calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session','on') -%}
+              {%- set automations_on = is_state('input_boolean.fox_remote_control_enabled','on') -%}
+              {%- set fc_during_peak = (mode == 'Force Charge' and not offpeak and not tesla and not perk) -%}
+
+              ## Tonight & Status
+
+              {% if not automations_on -%}
+              ⚠️ **Automations DISABLED** — manual only.
+              {%- elif fc_during_peak -%}
+              🔴 **Stuck in Force Charge during peak.**
+              {%- else -%}
+              🟢 Mode `{{ mode }}` consistent with rate window.
+              {%- endif %}
+
+              | | |
+              |---|---|
+              | Off-peak window | 23:30 → {{ deadline[:5] }} |
+              | Charge target | {{ max_soc | int }}% |
+              | Usable capacity | {{ usable }} kWh |
+              | Evening discharge rate | {{ rate }} kW |
+
+      # -----------------------------------------------------------------
+      # CONTROLS — full-width, behind a heading so it's clearly
+      # operator-mode rather than glance-mode
+      # -----------------------------------------------------------------
+      - type: grid
+        column_span: 3
+        cards:
+          - type: heading
+            heading: Controls
+            icon: mdi:tune
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - entity: input_boolean.fox_remote_control_enabled
+                name: Automations enabled
+              - entity: input_number.battery_max_soc
+                name: Max SoC
+              - entity: input_number.battery_min_soc
+                name: Min SoC
+              - entity: input_number.battery_discharge_soc_target
+                name: Stop evening discharge at
+              - entity: input_number.target_discharge_rate_kw
+                name: Evening discharge rate
+              - entity: input_number.tesla_peak_assist_min_soc
+                name: Tesla peak-assist min SoC
+              - entity: input_datetime.charge_deadline
+                name: Off-peak charge deadline
+            grid_options:
+              columns: 6
+              rows: auto
+          - type: entities
+            show_header_toggle: false
+            entities:
+              - type: section
+                label: Rate estimates (for £ calculations)
+              - entity: input_number.peak_import_rate_estimate
+                name: Peak import rate
+              - entity: input_number.off_peak_import_rate_estimate
+                name: Off-peak import rate
+              - type: section
+                label: Hardware
+              - entity: sensor.battery_soh
+                name: Battery SoH
+              - entity: sensor.battery_temp
+                name: Battery temp
+              - entity: sensor.invtemp
+                name: Inverter temp
+              - entity: sensor.ambtemp
+                name: Ambient
+            grid_options:
+              columns: 6
+              rows: auto
+
+      # -----------------------------------------------------------------
+      # TRENDS — only the two that matter day-to-day
+      # -----------------------------------------------------------------
+      - type: grid
+        column_span: 3
+        cards:
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: 24h Power Flow
+              show_states: false
+            graph_span: 24h
+            span:
+              end: minute
+            yaxis:
+              - id: kw
+                decimals: 2
+                apex_config:
+                  title:
+                    text: kW
+            series:
+              - entity: sensor.pv_power
+                name: Solar
+                yaxis_id: kw
+                color: '#f1c40f'
+                stroke_width: 2
+                opacity: 0.5
+                type: area
+                group_by:
+                  func: avg
+                  duration: 5min
+              - entity: sensor.load_power
+                name: House
+                yaxis_id: kw
+                color: '#3498db'
+                stroke_width: 2
+                type: line
+                group_by:
+                  func: avg
+                  duration: 5min
+              - entity: sensor.feed_in
+                name: Export
+                yaxis_id: kw
+                color: '#16a085'
+                stroke_width: 1
+                type: line
+                group_by:
+                  func: avg
+                  duration: 5min
+              - entity: sensor.grid_consumption
+                name: Import
+                yaxis_id: kw
+                color: '#c0392b'
+                stroke_width: 1
+                type: line
+                group_by:
+                  func: avg
+                  duration: 5min
+          - type: custom:apexcharts-card
+            header:
+              show: true
+              title: Daily Financial Gain (30 days)
+            graph_span: 30d
+            span:
+              end: day
+            yaxis:
+              - id: gbp
+                decimals: 2
+                apex_config:
+                  title:
+                    text: '£'
+            series:
+              - entity: sensor.total_daily_financial_gain
+                name: Daily Gain
+                yaxis_id: gbp
+                color: '#16a085'
+                type: column
+                group_by:
+                  func: max
+                  duration: 1d
+
+      # -----------------------------------------------------------------
+      # OCTOPUS — cheapest windows + perks + cost breakdown
+      # -----------------------------------------------------------------
+      - type: grid
+        column_span: 3
+        cards:
+          - type: markdown
+            content: |
+              ## ⚡ Cheapest Windows (next 24h)
+              {%- set sensors = [
+                ('binary_sensor.target_timeframes_event_octopus_energy_electricity_<METER>_<MPAN>_current_day_rates_cheapest_3hr_today', '3 hr (laundry / dishwasher)'),
+                ('binary_sensor.target_timeframes_event_octopus_energy_electricity_<METER>_<MPAN>_current_day_rates_cheapest_1hr_today', '1 hr (hot water / EV top-up)'),
+                ('binary_sensor.target_timeframes_event_octopus_energy_electricity_<METER>_<MPAN>_current_day_rates_cheapest_4hr_intermittent_today', '4 hr intermittent'),
+              ] %}
+              {%- for sid, label in sensors %}
+              {%- set st = states(sid) %}
+              {%- if st in ['unknown', 'unavailable', none] %}
+              - **{{ label }}**: _waiting for rate data_
+              {%- else %}
+              {%- set tt = state_attr(sid, 'target_times') %}
+              {%- if tt %}
+              {%- set start_dt = tt[0].start | as_datetime %}
+              {%- set end_dt = tt[-1].end | as_datetime %}
+              {%- set avg = state_attr(sid, 'overall_average_value') %}
+              - **{{ label }}**:
+                {%- if st == 'on' %} 🟢 **ACTIVE NOW**{% endif %}
+                {{ start_dt.strftime('%a %H:%M') if start_dt else '?' }} – {{ end_dt.strftime('%H:%M') if end_dt else '?' }}
+                @ avg £{{ '%.3f' % avg if avg is not none else '?' }}/kWh
+              {%- else %}
+              - **{{ label }}**: _no target window calculated yet_
+              {%- endif %}
+              {%- endif %}
+              {%- endfor %}
+
+      - type: grid
+        column_span: 3
+        columns: 2
+        cards:
+          - type: entities
+            title: 🟢 Octopus Perks
+            entities:
+              - entity: calendar.octopus_energy_a_<ACCOUNT>_octoplus_free_electricity_session
+                name: Free Electricity (active?)
+              - entity: calendar.octopus_energy_a_<ACCOUNT>_octoplus_saving_sessions
+                name: Saving Session (active?)
+              - entity: calendar.octopus_energy_a_<ACCOUNT>_greener_nights
+                name: Greener Nights
+              - entity: sensor.octopus_energy_a_<ACCOUNT>_greenness_forecast_current_index
+                name: Grid Greenness (now)
+              - entity: sensor.octopus_energy_a_<ACCOUNT>_greenness_forecast_next_index
+                name: Grid Greenness (next)
+              - entity: sensor.octopus_energy_a_<ACCOUNT>_octoplus_points
+                name: Octoplus Points
+              - entity: sensor.octopus_energy_a_<ACCOUNT>_wheel_of_fortune_spins_electricity
+                name: WoF Spins (elec)
+              - entity: sensor.octopus_energy_a_<ACCOUNT>_wheel_of_fortune_spins_gas
+                name: WoF Spins (gas)
+
+          - type: entities
+            title: 📊 Peak vs Off-Peak (today / yesterday)
+            entities:
+              - type: section
+                label: Today
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_consumption_peak
+                name: Peak kWh
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_consumption_off_peak
+                name: Off-Peak kWh
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_cost_peak
+                name: Peak £
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_current_accumulative_cost_off_peak
+                name: Off-Peak £
+              - type: section
+                label: Yesterday
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_previous_accumulative_cost_peak
+                name: Peak £
+              - entity: sensor.octopus_energy_electricity_<METER>_<MPAN>_previous_accumulative_cost_off_peak
+                name: Off-Peak £
+
+      - type: grid
+        column_span: 3
+        cards:
+          - type: markdown
+            content: |
+              ## 💷 Cost Tracker — this month
+              {%- macro money(s) -%}
+              {%- if states(s) in ['unknown','unavailable',none] -%}—{%- else -%}£{{ '%.2f' % (states(s)|float(0)) }}{%- endif -%}
+              {%- endmacro %}
+              | Flow | Today | This week | This month |
+              |---|---|---|---|
+              | Grid import      | {{ money('sensor.octopus_energy_cost_tracker_grid_consumption_today') }} | {{ money('sensor.octopus_energy_cost_tracker_grid_consumption_today_week') }} | {{ money('sensor.octopus_energy_cost_tracker_grid_consumption_today_month') }} |
+              | Export earnings  | {{ money('sensor.octopus_energy_cost_tracker_export_cost') }} | {{ money('sensor.octopus_energy_cost_tracker_export_cost_week') }} | {{ money('sensor.octopus_energy_cost_tracker_export_cost_month') }} |
+              | Solar value      | {{ money('sensor.octopus_energy_cost_tracker_solar_generation_today') }} | {{ money('sensor.octopus_energy_cost_tracker_solar_generation_today_week') }} | {{ money('sensor.octopus_energy_cost_tracker_solar_generation_today_month') }} |
+              | Battery charged  | {{ money('sensor.octopus_energy_cost_tracker_battery_charge_today') }} | {{ money('sensor.octopus_energy_cost_tracker_battery_charge_today_week') }} | {{ money('sensor.octopus_energy_cost_tracker_battery_charge_today_month') }} |
+              | Battery used     | {{ money('sensor.octopus_energy_cost_tracker_battery_discharge_today') }} | {{ money('sensor.octopus_energy_cost_tracker_battery_discharge_today_week') }} | {{ money('sensor.octopus_energy_cost_tracker_battery_discharge_today_month') }} |
+              | Tesla charging   | {{ money('sensor.octopus_energy_cost_tracker_tesla_charging_cost') }} | {{ money('sensor.octopus_energy_cost_tracker_tesla_charging_cost_week') }} | {{ money('sensor.octopus_energy_cost_tracker_tesla_charging_cost_month') }} |
+
+              {%- set bd_m = states('sensor.octopus_energy_cost_tracker_battery_discharge_today_month')|float(0) -%}
+              {%- set bc_m = states('sensor.octopus_energy_cost_tracker_battery_charge_today_month')|float(0) -%}
+              {%- set arb = bd_m - bc_m -%}
+              {# abs() the export-cost side because the Octopus cost tracker
+                 reports export earnings as a positive £ value regardless of
+                 internal sign convention. Subtract earnings from import to
+                 produce a "bill" where positive = you owe. #}
+              {%- set imp_m = states('sensor.octopus_energy_cost_tracker_grid_consumption_today_month')|float(0) -%}
+              {%- set exp_m = states('sensor.octopus_energy_cost_tracker_export_cost_month')|float(0) | abs -%}
+              {%- set net = imp_m - exp_m -%}
+
+              **Battery arbitrage profit (month)**: £{{ '%.2f' % arb }}
+              **Net electricity bill (month)**: £{{ '%.2f' % net }}
+              <small>(positive = you owe; negative = Octopus owes you)</small>

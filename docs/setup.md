@@ -97,7 +97,7 @@ This defines:
 	•	Check resources (Settings → Dashboards → Resources):
 add the two URLs above if HACS didn’t auto-add them.
 	•	Create a dashboard (Settings → Dashboards → + Add Dashboard → “Solar & Battery”).
-	•	Open it → ⋮ → Edit dashboard → Raw configuration editor → paste home-assistant/lovelace.dashboard.yaml.
+	•	Open it → ⋮ → Edit dashboard → Raw configuration editor → paste home-assistant/dashboards/energy_ops.yaml.
 
 4) Replace Octopus placeholders
 
